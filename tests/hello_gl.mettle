@@ -1,0 +1,59 @@
+// smoke test: a window, a GL 3.3 core context, one shaded triangle; quits after 120 frames
+import "std/ui";
+import "std/io";
+import "std/mem";
+import "engine/gl";
+
+var VS_SRC: string = import_str "hello_vs.glsl";
+var FS_SRC: string = import_str "hello_fs.glsl";
+
+fn proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  if (msg == UI_WM_DESTROY()) { ui_quit(0); return 0; }
+  return ui_def_window_proc(hwnd, msg, wparam, lparam);
+}
+
+fn main() -> int32 {
+  var hwnd: int64 = ui_window_create_centered("hello gl".chars, 640, 480, &proc);
+  ui_window_show(hwnd);
+  if (gl_create(hwnd) == 0) { return 1; }
+  print("GL "); println_cstr(glGetString(GL_VERSION()));
+  print("on "); println_cstr(glGetString(GL_RENDERER()));
+  var vs: cstring = VS_SRC.chars;
+  var fs: cstring = FS_SRC.chars;
+  var prog: uint32 = gl_program(vs, fs, "hello".chars);
+  if (prog == (uint32)0) { return 2; }
+  var v: float32* = (float32*)malloc(18 * 4);
+  v[0] = -0.6; v[1] = -0.5; v[2] = 0.0; v[3] = 1.0; v[4] = 0.2; v[5] = 0.1;
+  v[6] = 0.6; v[7] = -0.5; v[8] = 0.0; v[9] = 0.1; v[10] = 1.0; v[11] = 0.2;
+  v[12] = 0.0; v[13] = 0.6; v[14] = 0.0; v[15] = 0.2; v[16] = 0.3; v[17] = 1.0;
+  var vao: uint32 = glGenVertexArray();
+  glBindVertexArray(vao);
+  var vbo: uint32 = glGenBuffer();
+  glBindBuffer(GL_ARRAY_BUFFER(), vbo);
+  glBufferData(GL_ARRAY_BUFFER(), 72, (uint8*)v, GL_STATIC_DRAW());
+  glEnableVertexAttribArray((uint32)0);
+  glVertexAttribPointer((uint32)0, 3, GL_FLOAT(), (uint8)0, 24, 0);
+  glEnableVertexAttribArray((uint32)1);
+  glVertexAttribPointer((uint32)1, 3, GL_FLOAT(), (uint8)0, 24, 12);
+  var msg: UiMsg;
+  var frames: int32 = 0;
+  var running: int32 = 1;
+  while (running != 0 && frames < 120) {
+    while (Ui_PeekMessageA(&msg, 0, 0, 0, UI_PM_REMOVE()) != 0) {
+      if (msg.message == UI_WM_QUIT()) { running = 0; }
+      Ui_TranslateMessage(&msg);
+      Ui_DispatchMessageA(&msg);
+    }
+    glViewport(0, 0, 640, 480);
+    glClearColor(0.1, 0.12, 0.15, 1.0);
+    glClear(GL_COLOR_BUFFER_BIT());
+    glUseProgram(prog);
+    glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLES(), 0, 3);
+    gl_swap();
+    frames = frames + 1;
+  }
+  println("frames: {frames}");
+  println("glGetError: {(int32)glGetError()}");
+  return 0;
+}

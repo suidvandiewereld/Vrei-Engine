@@ -1,0 +1,198 @@
+// Vectors, quaternions, 4x4 matrices (float32, column-major as GL takes them), a random source, and the small
+// helpers the Roblox code leans on (math.clamp, the eased rates 1 - e^(-k dt), angle wrap).
+import "std/mem";
+
+// (std/math is imported by the entry file, reach.mettle: a module that imports an `export`-using one hides its own
+// undeclared-public types from its importers)
+
+// (the C runtime's double-precision math isn't on the internal linker's search: std/math's own)
+fn m_sin(x: float64) -> float64 { return sin(x); }
+fn m_cos(x: float64) -> float64 { return cos(x); }
+fn m_tan(x: float64) -> float64 { return tan(x); }
+fn m_sqrt(x: float64) -> float64 { return sqrt(x); }
+fn m_atan2(y: float64, x: float64) -> float64 { return atan2(y, x); }
+fn m_asin(x: float64) -> float64 { return asin(x); }
+fn m_acos(x: float64) -> float64 { return acos(x); }
+fn m_floor(x: float64) -> float64 { return floor(x); }
+fn m_exp(x: float64) -> float64 { return exp(x); }
+fn m_log(x: float64) -> float64 { return log(x); }
+fn m_pow(x: float64, y: float64) -> float64 { return pow(x, y); }
+fn m_fmod(x: float64, y: float64) -> float64 { return fmod(x, y); }
+
+fn rad(d: float64) -> float64 { return d * 0.017453292519943295; }
+
+fn absf(x: float64) -> float64 { if (x < 0.0) { return -x; } return x; }
+fn minf(a: float64, b: float64) -> float64 { if (a < b) { return a; } return b; }
+fn maxf(a: float64, b: float64) -> float64 { if (a > b) { return a; } return b; }
+fn clampf(x: float64, lo: float64, hi: float64) -> float64 { if (x < lo) { return lo; } if (x > hi) { return hi; } return x; }
+fn lerpf(a: float64, b: float64, t: float64) -> float64 { return a + (b - a) * t; }
+fn signf(x: float64) -> float64 { if (x > 0.0) { return 1.0; } if (x < 0.0) { return -1.0; } return 0.0; }
+// smoothstep on 0..1
+fn smooth(u: float64) -> float64 { var x: float64 = clampf(u, 0.0, 1.0); return x * x * (3.0 - 2.0 * x); }
+// the fraction of the way an eased value closes in dt at rate k (1 - e^(-k dt))
+fn expk(rate: float64, dt: float64) -> float64 { return 1.0 - m_exp(-rate * dt); }
+// an angle into -pi..pi
+fn wrapa(a: float64) -> float64 {
+  var x: float64 = m_fmod(a + PI(), TAU());
+  if (x < 0.0) { x = x + TAU(); }
+  return x - PI();
+}
+// a value into 0..m
+fn modf1(a: float64, m: float64) -> float64 {
+  var x: float64 = m_fmod(a, m);
+  if (x < 0.0) { x = x + m; }
+  return x;
+}
+
+// ---------------------------------------------------------------- random
+var rng_state: uint64 = (uint64)0x9E3779B97F4A7C15;
+fn rnd() -> float64 {
+  rng_state = rng_state ^ (rng_state << 13);
+  rng_state = rng_state ^ (rng_state >> 7);
+  rng_state = rng_state ^ (rng_state << 17);
+  return (float64)(rng_state >> 11) * (1.0 / 9007199254740992.0);
+}
+fn rnd_range(a: float64, b: float64) -> float64 { return a + (b - a) * rnd(); }
+// a standard normal (Box-Muller): the spread's 1-sigma draws
+fn gauss() -> float64 {
+  return m_sqrt(-2.0 * m_log(maxf(rnd(), 0.000000001))) * m_cos(TAU() * rnd());
+}
+
+// ---------------------------------------------------------------- vectors
+struct Vec3 { x: float64; y: float64; z: float64; }
+
+fn v3(x: float64, y: float64, z: float64) -> Vec3 { var v: Vec3; v.x = x; v.y = y; v.z = z; return v; }
+fn vzero() -> Vec3 { return v3(0.0, 0.0, 0.0); }
+fn vadd(a: Vec3, b: Vec3) -> Vec3 { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+fn vsub(a: Vec3, b: Vec3) -> Vec3 { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+fn vmul(a: Vec3, s: float64) -> Vec3 { return v3(a.x * s, a.y * s, a.z * s); }
+fn vneg(a: Vec3) -> Vec3 { return v3(-a.x, -a.y, -a.z); }
+fn vdot(a: Vec3, b: Vec3) -> float64 { return a.x * b.x + a.y * b.y + a.z * b.z; }
+fn vcross(a: Vec3, b: Vec3) -> Vec3 { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+fn vlen(a: Vec3) -> float64 { return m_sqrt(a.x * a.x + a.y * a.y + a.z * a.z); }
+fn vflat(a: Vec3) -> Vec3 { return v3(a.x, 0.0, a.z); }
+fn vlerp(a: Vec3, b: Vec3, t: float64) -> Vec3 { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+fn vunit(a: Vec3) -> Vec3 {
+  var l: float64 = vlen(a);
+  if (l < 0.000001) { return vzero(); }
+  return vmul(a, 1.0 / l);
+}
+fn vdist(a: Vec3, b: Vec3) -> float64 { return vlen(vsub(a, b)); }
+// Roblox's frame: yaw 0 looks down -Z; the way a yaw faces, and the yaw of a way
+fn fwd_of(yaw: float64) -> Vec3 { return v3(-m_sin(yaw), 0.0, -m_cos(yaw)); }
+fn right_of(yaw: float64) -> Vec3 { return v3(m_cos(yaw), 0.0, -m_sin(yaw)); }
+fn yaw_to(d: Vec3) -> float64 { return m_atan2(-d.x, -d.z); }
+// a vector turned by yaw about +Y (CFrame.Angles(0, yaw, 0):VectorToWorldSpace)
+fn vrot_y(v: Vec3, yaw: float64) -> Vec3 {
+  var c: float64 = m_cos(yaw);
+  var s: float64 = m_sin(yaw);
+  return v3(v.x * c + v.z * s, v.y, -v.x * s + v.z * c);
+}
+
+// ---------------------------------------------------------------- quaternions (x, y, z, w)
+struct Quat { x: float64; y: float64; z: float64; w: float64; }
+
+fn q4(x: float64, y: float64, z: float64, w: float64) -> Quat { var q: Quat; q.x = x; q.y = y; q.z = z; q.w = w; return q; }
+fn qident() -> Quat { return q4(0.0, 0.0, 0.0, 1.0); }
+fn qmul(a: Quat, b: Quat) -> Quat {
+  return q4(a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
+}
+fn qconj(a: Quat) -> Quat { return q4(-a.x, -a.y, -a.z, a.w); }
+fn qnorm(a: Quat) -> Quat {
+  var l: float64 = m_sqrt(a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w);
+  if (l < 0.000000001) { return qident(); }
+  return q4(a.x / l, a.y / l, a.z / l, a.w / l);
+}
+fn qaxis(axis: Vec3, ang: float64) -> Quat {
+  var u: Vec3 = vunit(axis);
+  var s: float64 = m_sin(ang * 0.5);
+  return q4(u.x * s, u.y * s, u.z * s, m_cos(ang * 0.5));
+}
+fn qrot(q: Quat, v: Vec3) -> Vec3 {
+  // v + 2 w (u x v) + 2 u x (u x v)
+  var u: Vec3 = v3(q.x, q.y, q.z);
+  var t: Vec3 = vmul(vcross(u, v), 2.0);
+  return vadd(vadd(v, vmul(t, q.w)), vcross(u, t));
+}
+// nlerp on the short way round (the blends: close keys, so it's as good as a slerp)
+fn qlerp(a: Quat, b: Quat, t: float64) -> Quat {
+  var d: float64 = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+  var s: float64 = 1.0;
+  if (d < 0.0) { s = -1.0; }
+  return qnorm(q4(a.x + (b.x * s - a.x) * t, a.y + (b.y * s - a.y) * t, a.z + (b.z * s - a.z) * t, a.w + (b.w * s - a.w) * t));
+}
+// Euler YXZ (Roblox's ToEulerAnglesYXZ / fromEulerAnglesYXZ): R = Ry(y) Rx(x) Rz(z)
+fn qeuler_yxz(x: float64, y: float64, z: float64) -> Quat {
+  return qmul(qmul(qaxis(v3(0.0, 1.0, 0.0), y), qaxis(v3(1.0, 0.0, 0.0), x)), qaxis(v3(0.0, 0.0, 1.0), z));
+}
+// -> (x, y, z) in out
+fn qto_euler_yxz(q: Quat, out: Vec3*) {
+  // the matrix terms YXZ needs
+  var m12: float64 = 2.0 * (q.y * q.z - q.x * q.w);
+  var m02: float64 = 2.0 * (q.x * q.z + q.y * q.w);
+  var m22: float64 = 1.0 - 2.0 * (q.x * q.x + q.y * q.y);
+  var m10: float64 = 2.0 * (q.x * q.y + q.z * q.w);
+  var m11: float64 = 1.0 - 2.0 * (q.x * q.x + q.z * q.z);
+  out->x = m_asin(clampf(-m12, -1.0, 1.0));
+  out->y = m_atan2(m02, m22);
+  out->z = m_atan2(m10, m11);
+}
+
+// ---------------------------------------------------------------- matrices
+fn m4_ident(m: float32*) {
+  var i: int32 = 0;
+  while (i < 16) { m[i] = 0.0; i = i + 1; }
+  m[0] = 1.0; m[5] = 1.0; m[10] = 1.0; m[15] = 1.0;
+}
+// out = a * b (out may not alias)
+fn m4_mul(out: float32*, a: float32*, b: float32*) {
+  var c: int32 = 0;
+  while (c < 4) {
+    var r: int32 = 0;
+    while (r < 4) {
+      out[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+      r = r + 1;
+    }
+    c = c + 1;
+  }
+}
+fn m4_copy(out: float32*, a: float32*) { var i: int32 = 0; while (i < 16) { out[i] = a[i]; i = i + 1; } }
+// rotation q, then translation p, scale s (uniform)
+fn m4_from_qt(m: float32*, q: Quat, p: Vec3) {
+  var x: float64 = q.x; var y: float64 = q.y; var z: float64 = q.z; var w: float64 = q.w;
+  m[0] = 1.0 - 2.0 * (y * y + z * z); m[1] = 2.0 * (x * y + z * w); m[2] = 2.0 * (x * z - y * w); m[3] = 0.0;
+  m[4] = 2.0 * (x * y - z * w); m[5] = 1.0 - 2.0 * (x * x + z * z); m[6] = 2.0 * (y * z + x * w); m[7] = 0.0;
+  m[8] = 2.0 * (x * z + y * w); m[9] = 2.0 * (y * z - x * w); m[10] = 1.0 - 2.0 * (x * x + y * y); m[11] = 0.0;
+  m[12] = p.x; m[13] = p.y; m[14] = p.z; m[15] = 1.0;
+}
+// the view matrix of a camera at p with rotation q (it looks down its -Z): the inverse of its frame
+fn m4_view(m: float32*, q: Quat, p: Vec3) {
+  var c: Quat = qconj(q);
+  var t: Vec3 = qrot(c, vneg(p));
+  m4_from_qt(m, c, t);
+}
+// vertical fov (radians), aspect, near, far
+fn m4_persp(m: float32*, fovy: float64, aspect: float64, n: float64, f: float64) {
+  var t: float64 = 1.0 / m_tan(fovy * 0.5);
+  var i: int32 = 0;
+  while (i < 16) { m[i] = 0.0; i = i + 1; }
+  m[0] = t / aspect;
+  m[5] = t;
+  m[10] = (f + n) / (n - f);
+  m[11] = -1.0;
+  m[14] = 2.0 * f * n / (n - f);
+}
+fn m4_ortho(m: float32*, l: float64, r: float64, b: float64, t: float64, n: float64, f: float64) {
+  var i: int32 = 0;
+  while (i < 16) { m[i] = 0.0; i = i + 1; }
+  m[0] = 2.0 / (r - l); m[5] = 2.0 / (t - b); m[10] = -2.0 / (f - n);
+  m[12] = -(r + l) / (r - l); m[13] = -(t + b) / (t - b); m[14] = -(f + n) / (f - n); m[15] = 1.0;
+}
+// a point through m (w = 1)
+fn m4_point(m: float32*, p: Vec3) -> Vec3 {
+  return v3(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12], m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+            m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
+}

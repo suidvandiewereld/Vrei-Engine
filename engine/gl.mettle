@@ -1,0 +1,600 @@
+// OpenGL 3.3 core on Win32: the context (WGL, upgraded through wglCreateContextAttribsARB) and the GL 2+ entry
+// points, fetched once through wglGetProcAddress into one table and called through typed function pointers.
+// GL 1.1 comes straight from opengl32.dll (build with --link-arg -lopengl32).
+import "std/io";
+import "std/mem";
+
+extern fn Gl_ChoosePixelFormat(hdc: int64, pfd: uint8*) -> int32 = "ChoosePixelFormat";
+extern fn Gl_SetPixelFormat(hdc: int64, fmt: int32, pfd: uint8*) -> int32 = "SetPixelFormat";
+extern fn Gl_SwapBuffers(hdc: int64) -> int32 = "SwapBuffers";
+extern fn Wgl_CreateContext(hdc: int64) -> int64 = "wglCreateContext";
+extern fn Wgl_DeleteContext(hglrc: int64) -> int32 = "wglDeleteContext";
+extern fn Wgl_MakeCurrent(hdc: int64, hglrc: int64) -> int32 = "wglMakeCurrent";
+extern fn Wgl_GetProcAddress(name: cstring) -> int64 = "wglGetProcAddress";
+extern fn Gl_GetDC(hwnd: int64) -> int64 = "GetDC";
+
+extern fn glViewport(x: int32, y: int32, w: int32, h: int32) = "glViewport";
+extern fn glClearColor(r: float32, g: float32, b: float32, a: float32) = "glClearColor";
+extern fn glClear(mask: uint32) = "glClear";
+extern fn glGetIntegerv(pname: uint32, data: int32*) = "glGetIntegerv";
+extern fn glGetString(name: uint32) -> cstring = "glGetString";
+extern fn glGetError() -> uint32 = "glGetError";
+extern fn glEnable(cap: uint32) = "glEnable";
+extern fn glDisable(cap: uint32) = "glDisable";
+extern fn glDepthFunc(func: uint32) = "glDepthFunc";
+extern fn glDepthMask(flag: uint8) = "glDepthMask";
+extern fn glCullFace(mode: uint32) = "glCullFace";
+extern fn glBlendFunc(sf: uint32, df: uint32) = "glBlendFunc";
+extern fn glColorMask(r: uint8, g: uint8, b: uint8, a: uint8) = "glColorMask";
+extern fn glPolygonOffset(factor: float32, units: float32) = "glPolygonOffset";
+extern fn glDrawArrays(mode: uint32, first: int32, count: int32) = "glDrawArrays";
+extern fn glDrawElements(mode: uint32, count: int32, typ: uint32, offset: int64) = "glDrawElements";
+extern fn glGenTextures(n: int32, out: uint32*) = "glGenTextures";
+extern fn glBindTexture(target: uint32, tex: uint32) = "glBindTexture";
+extern fn glTexImage2D(target: uint32, level: int32, ifmt: int32, w: int32, h: int32, border: int32, fmt: uint32, typ: uint32, data: uint8*) = "glTexImage2D";
+extern fn glTexParameteri(target: uint32, pname: uint32, v: int32) = "glTexParameteri";
+extern fn glPixelStorei(pname: uint32, v: int32) = "glPixelStorei";
+extern fn glReadPixels(x: int32, y: int32, w: int32, h: int32, fmt: uint32, typ: uint32, out: uint8*) = "glReadPixels";
+extern fn glReadBuffer(mode: uint32) = "glReadBuffer";
+extern fn glFlush() = "glFlush";
+extern fn glDrawBuffer(mode: uint32) = "glDrawBuffer";
+
+fn GL_COLOR_BUFFER_BIT() -> uint32 { return 0x4000; }
+fn GL_DEPTH_BUFFER_BIT() -> uint32 { return 0x0100; }
+fn GL_TRIANGLES() -> uint32 { return 4; }
+fn GL_LINES() -> uint32 { return 1; }
+fn GL_UNSIGNED_INT() -> uint32 { return 0x1405; }
+fn GL_UNSIGNED_BYTE() -> uint32 { return 0x1401; }
+fn GL_FLOAT() -> uint32 { return 0x1406; }
+fn GL_DEPTH_TEST() -> uint32 { return 0x0B71; }
+fn GL_CULL_FACE() -> uint32 { return 0x0B44; }
+fn GL_BLEND() -> uint32 { return 0x0BE2; }
+fn GL_BACK() -> uint32 { return 0x0405; }
+fn GL_FRONT() -> uint32 { return 0x0404; }
+fn GL_LEQUAL() -> uint32 { return 0x0203; }
+fn GL_LESS() -> uint32 { return 0x0201; }
+fn GL_SRC_ALPHA() -> uint32 { return 0x0302; }
+fn GL_ONE_MINUS_SRC_ALPHA() -> uint32 { return 0x0303; }
+fn GL_ONE() -> uint32 { return 1; }
+fn GL_POLYGON_OFFSET_FILL() -> uint32 { return 0x8037; }
+fn GL_TEXTURE_2D() -> uint32 { return 0x0DE1; }
+fn GL_RGBA() -> uint32 { return 0x1908; }
+fn GL_RGBA8() -> int32 { return 0x8058; }
+fn GL_RED() -> uint32 { return 0x1903; }
+fn GL_R8() -> int32 { return 0x8229; }
+fn GL_DEPTH_COMPONENT() -> uint32 { return 0x1902; }
+fn GL_DEPTH_COMPONENT24() -> int32 { return 0x81A6; }
+fn GL_TEXTURE_MIN_FILTER() -> uint32 { return 0x2801; }
+fn GL_TEXTURE_MAG_FILTER() -> uint32 { return 0x2800; }
+fn GL_TEXTURE_WRAP_S() -> uint32 { return 0x2802; }
+fn GL_TEXTURE_WRAP_T() -> uint32 { return 0x2803; }
+fn GL_TEXTURE_COMPARE_MODE() -> uint32 { return 0x884C; }
+fn GL_COMPARE_REF_TO_TEXTURE() -> int32 { return 0x884E; }
+fn GL_LINEAR() -> int32 { return 0x2601; }
+fn GL_NEAREST() -> int32 { return 0x2600; }
+fn GL_LINEAR_MIPMAP_LINEAR() -> int32 { return 0x2703; }
+fn GL_REPEAT() -> int32 { return 0x2901; }
+fn GL_CLAMP_TO_EDGE() -> int32 { return 0x812F; }
+fn GL_UNPACK_ALIGNMENT() -> uint32 { return 0x0CF5; }
+fn GL_PACK_ALIGNMENT() -> uint32 { return 0x0D05; }
+fn GL_TEXTURE0() -> uint32 { return 0x84C0; }
+fn GL_ARRAY_BUFFER() -> uint32 { return 0x8892; }
+fn GL_ELEMENT_ARRAY_BUFFER() -> uint32 { return 0x8893; }
+fn GL_STATIC_DRAW() -> uint32 { return 0x88E4; }
+fn GL_DYNAMIC_DRAW() -> uint32 { return 0x88E8; }
+fn GL_STREAM_DRAW() -> uint32 { return 0x88E0; }
+fn GL_VERTEX_SHADER() -> uint32 { return 0x8B31; }
+fn GL_FRAGMENT_SHADER() -> uint32 { return 0x8B30; }
+fn GL_COMPILE_STATUS() -> uint32 { return 0x8B81; }
+fn GL_LINK_STATUS() -> uint32 { return 0x8B82; }
+fn GL_FRAMEBUFFER() -> uint32 { return 0x8D40; }
+fn GL_DEPTH_ATTACHMENT() -> uint32 { return 0x8D00; }
+fn GL_FRAMEBUFFER_COMPLETE() -> uint32 { return 0x8CD5; }
+fn GL_NONE() -> uint32 { return 0; }
+fn GL_VERSION() -> uint32 { return 0x1F02; }
+fn GL_RENDERER() -> uint32 { return 0x1F01; }
+fn GL_MULTISAMPLE() -> uint32 { return 0x809D; }
+fn GL_FRAMEBUFFER_SRGB() -> uint32 { return 0x8DB9; }
+fn GL_RGBA16F() -> int32 { return 0x881A; }
+fn GL_HALF_FLOAT() -> uint32 { return 0x140B; }
+fn GL_COLOR_ATTACHMENT0() -> uint32 { return 0x8CE0; }
+
+// the GL 2+ entry points
+struct GlProcs {
+  CreateShader: int64; ShaderSource: int64; CompileShader: int64; GetShaderiv: int64; GetShaderInfoLog: int64;
+  CreateProgram: int64; AttachShader: int64; LinkProgram: int64; GetProgramiv: int64; GetProgramInfoLog: int64;
+  UseProgram: int64; GetUniformLocation: int64; UniformMatrix4fv: int64; Uniform1i: int64; Uniform1f: int64;
+  Uniform2f: int64; Uniform3f: int64; Uniform4f: int64; Uniform4fv: int64; BindAttribLocation: int64; Uniform1iv: int64;
+  GenVertexArrays: int64; BindVertexArray: int64; GenBuffers: int64; BindBuffer: int64; BufferData: int64;
+  BufferSubData: int64; EnableVertexAttribArray: int64; VertexAttribPointer: int64; VertexAttribDivisor: int64;
+  DrawElementsInstanced: int64; DrawArraysInstanced: int64; ActiveTexture: int64; GenerateMipmap: int64;
+  GenFramebuffers: int64; BindFramebuffer: int64; FramebufferTexture2D: int64; CheckFramebufferStatus: int64;
+  SwapIntervalEXT: int64;
+  DrawBuffers: int64;
+  TransformFeedbackVaryings: int64; BeginTransformFeedback: int64; EndTransformFeedback: int64;
+  BindBufferBase: int64; BindBufferRange: int64; TexBuffer: int64; GetBufferSubData: int64;
+  BeginQuery: int64; EndQuery: int64; VertexAttribIPointer: int64; BlendEquation: int64; BlendFuncSeparate: int64;
+  GenQueries: int64; QueryCounter: int64; GetQueryObjectiv: int64; GetQueryObjectui64v: int64;
+  // the frame's counts (the F7 overlay): what was drawn, what was sent
+  n_draws: int64; n_tris: int64; n_verts: int64; n_uni: int64; uni_bytes: int64; buf_bytes: int64;
+  n_progs: int64; n_texs: int64; n_passes: int64;
+}
+
+fn gl_stats_reset() {
+  glp->n_draws = 0; glp->n_tris = 0; glp->n_verts = 0; glp->n_uni = 0; glp->uni_bytes = 0; glp->buf_bytes = 0;
+  glp->n_progs = 0; glp->n_texs = 0; glp->n_passes = 0;
+}
+fn gl_count_draw(verts: int64) { glp->n_draws = glp->n_draws + 1; glp->n_verts = glp->n_verts + verts; glp->n_tris = glp->n_tris + verts / 3; }
+
+var glp: GlProcs* = 0;
+var gl_dc: int64 = 0;
+var gl_rc: int64 = 0;
+
+fn gl_proc(name: cstring) -> int64 {
+  var p: int64 = Wgl_GetProcAddress(name);
+  if (p == 0 || p == 1 || p == 2 || p == 3 || p == -1) {
+    print("missing GL entry point: "); println_cstr(name);
+    return 0;
+  }
+  return p;
+}
+
+fn gl_load() -> int32 {
+  glp = new GlProcs;
+  glp->CreateShader = gl_proc("glCreateShader".chars);
+  glp->ShaderSource = gl_proc("glShaderSource".chars);
+  glp->CompileShader = gl_proc("glCompileShader".chars);
+  glp->GetShaderiv = gl_proc("glGetShaderiv".chars);
+  glp->GetShaderInfoLog = gl_proc("glGetShaderInfoLog".chars);
+  glp->CreateProgram = gl_proc("glCreateProgram".chars);
+  glp->AttachShader = gl_proc("glAttachShader".chars);
+  glp->LinkProgram = gl_proc("glLinkProgram".chars);
+  glp->GetProgramiv = gl_proc("glGetProgramiv".chars);
+  glp->GetProgramInfoLog = gl_proc("glGetProgramInfoLog".chars);
+  glp->UseProgram = gl_proc("glUseProgram".chars);
+  glp->GetUniformLocation = gl_proc("glGetUniformLocation".chars);
+  glp->UniformMatrix4fv = gl_proc("glUniformMatrix4fv".chars);
+  glp->Uniform1i = gl_proc("glUniform1i".chars);
+  glp->Uniform1f = gl_proc("glUniform1f".chars);
+  glp->Uniform2f = gl_proc("glUniform2f".chars);
+  glp->Uniform3f = gl_proc("glUniform3f".chars);
+  glp->Uniform4f = gl_proc("glUniform4f".chars);
+  glp->Uniform4fv = gl_proc("glUniform4fv".chars);
+  glp->Uniform1iv = gl_proc("glUniform1iv".chars);
+  glp->BindAttribLocation = gl_proc("glBindAttribLocation".chars);
+  glp->GenVertexArrays = gl_proc("glGenVertexArrays".chars);
+  glp->BindVertexArray = gl_proc("glBindVertexArray".chars);
+  glp->GenBuffers = gl_proc("glGenBuffers".chars);
+  glp->BindBuffer = gl_proc("glBindBuffer".chars);
+  glp->BufferData = gl_proc("glBufferData".chars);
+  glp->BufferSubData = gl_proc("glBufferSubData".chars);
+  glp->EnableVertexAttribArray = gl_proc("glEnableVertexAttribArray".chars);
+  glp->VertexAttribPointer = gl_proc("glVertexAttribPointer".chars);
+  glp->VertexAttribDivisor = gl_proc("glVertexAttribDivisor".chars);
+  glp->DrawElementsInstanced = gl_proc("glDrawElementsInstanced".chars);
+  glp->DrawArraysInstanced = gl_proc("glDrawArraysInstanced".chars);
+  glp->ActiveTexture = gl_proc("glActiveTexture".chars);
+  glp->GenerateMipmap = gl_proc("glGenerateMipmap".chars);
+  glp->GenFramebuffers = gl_proc("glGenFramebuffers".chars);
+  glp->BindFramebuffer = gl_proc("glBindFramebuffer".chars);
+  glp->FramebufferTexture2D = gl_proc("glFramebufferTexture2D".chars);
+  glp->CheckFramebufferStatus = gl_proc("glCheckFramebufferStatus".chars);
+  glp->SwapIntervalEXT = Wgl_GetProcAddress("wglSwapIntervalEXT".chars);
+  glp->DrawBuffers = gl_proc("glDrawBuffers".chars);
+  glp->TransformFeedbackVaryings = gl_proc("glTransformFeedbackVaryings".chars);
+  glp->BeginTransformFeedback = gl_proc("glBeginTransformFeedback".chars);
+  glp->EndTransformFeedback = gl_proc("glEndTransformFeedback".chars);
+  glp->BindBufferBase = gl_proc("glBindBufferBase".chars);
+  glp->BindBufferRange = gl_proc("glBindBufferRange".chars);
+  glp->TexBuffer = gl_proc("glTexBuffer".chars);
+  glp->GetBufferSubData = gl_proc("glGetBufferSubData".chars);
+  glp->BeginQuery = gl_proc("glBeginQuery".chars);
+  glp->EndQuery = gl_proc("glEndQuery".chars);
+  glp->VertexAttribIPointer = gl_proc("glVertexAttribIPointer".chars);
+  glp->BlendEquation = gl_proc("glBlendEquation".chars);
+  glp->BlendFuncSeparate = gl_proc("glBlendFuncSeparate".chars);
+  glp->GenQueries = gl_proc("glGenQueries".chars);
+  glp->QueryCounter = gl_proc("glQueryCounter".chars);
+  glp->GetQueryObjectiv = gl_proc("glGetQueryObjectiv".chars);
+  glp->GetQueryObjectui64v = gl_proc("glGetQueryObjectui64v".chars);
+  if (glp->CreateShader == 0 || glp->UseProgram == 0 || glp->GenVertexArrays == 0 || glp->BufferData == 0
+      || glp->DrawElementsInstanced == 0 || glp->GenFramebuffers == 0 || glp->UniformMatrix4fv == 0) {
+    return 0;
+  }
+  return 1;
+}
+
+// a pixel format with depth on the window's DC, a legacy context, then a 3.3 core one in its place
+fn gl_create(hwnd: int64) -> int32 {
+  gl_dc = Gl_GetDC(hwnd);
+  var pfd: uint8* = (uint8*)malloc(40);
+  var i: int32 = 0;
+  while (i < 40) { pfd[i] = (uint8)0; i = i + 1; }
+  pfd[0] = (uint8)40;                    // nSize
+  pfd[2] = (uint8)1;                     // nVersion
+  pfd[4] = (uint8)0x25;                  // DRAW_TO_WINDOW | SUPPORT_OPENGL | DOUBLEBUFFER
+  pfd[8] = (uint8)0;                     // RGBA
+  pfd[9] = (uint8)32;                    // colour bits
+  pfd[16] = (uint8)8;                    // alpha bits
+  pfd[23] = (uint8)24;                   // depth bits
+  pfd[24] = (uint8)8;                    // stencil bits
+  var fmt: int32 = Gl_ChoosePixelFormat(gl_dc, pfd);
+  if (fmt == 0) { println("ChoosePixelFormat failed"); return 0; }
+  if (Gl_SetPixelFormat(gl_dc, fmt, pfd) == 0) { println("SetPixelFormat failed"); return 0; }
+  var legacy: int64 = Wgl_CreateContext(gl_dc);
+  if (legacy == 0) { println("wglCreateContext failed"); return 0; }
+  Wgl_MakeCurrent(gl_dc, legacy);
+  gl_rc = legacy;
+  var proc: int64 = Wgl_GetProcAddress("wglCreateContextAttribsARB".chars);
+  if (proc != 0) {
+    var create_ctx: fn(int64, int64, int32*) -> int64 = (fn(int64, int64, int32*) -> int64)proc;
+    var at: int32* = (int32*)malloc(9 * 4);
+    at[0] = 0x2091; at[1] = 3;           // WGL_CONTEXT_MAJOR_VERSION_ARB
+    at[2] = 0x2092; at[3] = 3;           // WGL_CONTEXT_MINOR_VERSION_ARB
+    at[4] = 0x9126; at[5] = 1;           // WGL_CONTEXT_PROFILE_MASK_ARB: core
+    at[6] = 0x2094; at[7] = 0;           // WGL_CONTEXT_FLAGS_ARB
+    at[8] = 0;
+    var modern: int64 = create_ctx(gl_dc, 0, at);
+    if (modern != 0) {
+      Wgl_MakeCurrent(0, 0);
+      Wgl_DeleteContext(legacy);
+      gl_rc = modern;
+      Wgl_MakeCurrent(gl_dc, gl_rc);
+    }
+  }
+  if (gl_load() == 0) { println("GL 3.3 entry points missing"); return 0; }
+  return 1;
+}
+
+fn gl_swap() { Gl_SwapBuffers(gl_dc); }
+
+fn gl_vsync(on: int32) {
+  if (glp->SwapIntervalEXT != 0) {
+    var f: fn(int32) -> int32 = (fn(int32) -> int32)glp->SwapIntervalEXT;
+    f(on);
+  }
+}
+
+// ---------------------------------------------------------------- typed calls
+fn glCreateShader(t: uint32) -> uint32 { var f: fn(uint32) -> uint32 = (fn(uint32) -> uint32)glp->CreateShader; return f(t); }
+fn glShaderSource1(s: uint32, src: cstring) {
+  var f: fn(uint32, int32, cstring*, int32*) -> void = (fn(uint32, int32, cstring*, int32*) -> void)glp->ShaderSource;
+  var a: cstring* = (cstring*)malloc(8);
+  a[0] = src;
+  f(s, 1, a, (int32*)0);
+  free((uint8*)a);
+}
+fn glCompileShader(s: uint32) { var f: fn(uint32) -> void = (fn(uint32) -> void)glp->CompileShader; f(s); }
+fn glGetShaderiv(s: uint32, pname: uint32, out: int32*) { var f: fn(uint32, uint32, int32*) -> void = (fn(uint32, uint32, int32*) -> void)glp->GetShaderiv; f(s, pname, out); }
+fn glGetShaderInfoLog(s: uint32, cap: int32, len: int32*, out: uint8*) { var f: fn(uint32, int32, int32*, uint8*) -> void = (fn(uint32, int32, int32*, uint8*) -> void)glp->GetShaderInfoLog; f(s, cap, len, out); }
+fn glCreateProgram() -> uint32 { var f: fn() -> uint32 = (fn() -> uint32)glp->CreateProgram; return f(); }
+fn glAttachShader(p: uint32, s: uint32) { var f: fn(uint32, uint32) -> void = (fn(uint32, uint32) -> void)glp->AttachShader; f(p, s); }
+fn glLinkProgram(p: uint32) { var f: fn(uint32) -> void = (fn(uint32) -> void)glp->LinkProgram; f(p); }
+fn glGetProgramiv(p: uint32, pname: uint32, out: int32*) { var f: fn(uint32, uint32, int32*) -> void = (fn(uint32, uint32, int32*) -> void)glp->GetProgramiv; f(p, pname, out); }
+fn glGetProgramInfoLog(p: uint32, cap: int32, len: int32*, out: uint8*) { var f: fn(uint32, int32, int32*, uint8*) -> void = (fn(uint32, int32, int32*, uint8*) -> void)glp->GetProgramInfoLog; f(p, cap, len, out); }
+fn glUseProgram(p: uint32) { var f: fn(uint32) -> void = (fn(uint32) -> void)glp->UseProgram; glp->n_progs = glp->n_progs + 1; f(p); }
+fn glGetUniformLocation(p: uint32, n: cstring) -> int32 { var f: fn(uint32, cstring) -> int32 = (fn(uint32, cstring) -> int32)glp->GetUniformLocation; return f(p, n); }
+fn glUniformMatrix4fv(loc: int32, count: int32, m: float32*) { var f: fn(int32, int32, uint8, float32*) -> void = (fn(int32, int32, uint8, float32*) -> void)glp->UniformMatrix4fv; if (loc >= 0) { glp->n_uni = glp->n_uni + 1; glp->uni_bytes = glp->uni_bytes + (int64)count * 64; f(loc, count, (uint8)0, m); } }
+fn glUniform1i(loc: int32, v: int32) { var f: fn(int32, int32) -> void = (fn(int32, int32) -> void)glp->Uniform1i; if (loc >= 0) { glp->n_uni = glp->n_uni + 1; glp->uni_bytes = glp->uni_bytes + 4; f(loc, v); } }
+fn glUniform1f(loc: int32, v: float32) { var f: fn(int32, float32) -> void = (fn(int32, float32) -> void)glp->Uniform1f; if (loc >= 0) { glp->n_uni = glp->n_uni + 1; glp->uni_bytes = glp->uni_bytes + 4; f(loc, v); } }
+fn glUniform2f(loc: int32, x: float32, y: float32) { var f: fn(int32, float32, float32) -> void = (fn(int32, float32, float32) -> void)glp->Uniform2f; if (loc >= 0) { glp->n_uni = glp->n_uni + 1; glp->uni_bytes = glp->uni_bytes + 8; f(loc, x, y); } }
+fn glUniform3f(loc: int32, x: float32, y: float32, z: float32) { var f: fn(int32, float32, float32, float32) -> void = (fn(int32, float32, float32, float32) -> void)glp->Uniform3f; if (loc >= 0) { glp->n_uni = glp->n_uni + 1; glp->uni_bytes = glp->uni_bytes + 12; f(loc, x, y, z); } }
+fn glUniform4f(loc: int32, x: float32, y: float32, z: float32, w: float32) { var f: fn(int32, float32, float32, float32, float32) -> void = (fn(int32, float32, float32, float32, float32) -> void)glp->Uniform4f; if (loc >= 0) { f(loc, x, y, z, w); } }
+fn glUniform1iv(loc: int32, count: int32, v: int32*) { var f: fn(int32, int32, int32*) -> void = (fn(int32, int32, int32*) -> void)glp->Uniform1iv; if (loc >= 0) { f(loc, count, v); } }
+fn glUniform4fv(loc: int32, count: int32, v: float32*) { var f: fn(int32, int32, float32*) -> void = (fn(int32, int32, float32*) -> void)glp->Uniform4fv; if (loc >= 0) { f(loc, count, v); } }
+fn glBindAttribLocation(p: uint32, i: uint32, n: cstring) { var f: fn(uint32, uint32, cstring) -> void = (fn(uint32, uint32, cstring) -> void)glp->BindAttribLocation; f(p, i, n); }
+fn glGenVertexArray() -> uint32 { var f: fn(int32, uint32*) -> void = (fn(int32, uint32*) -> void)glp->GenVertexArrays; var a: uint32 = (uint32)0; f(1, &a); return a; }
+fn glBindVertexArray(a: uint32) { var f: fn(uint32) -> void = (fn(uint32) -> void)glp->BindVertexArray; f(a); }
+fn glGenBuffer() -> uint32 { var f: fn(int32, uint32*) -> void = (fn(int32, uint32*) -> void)glp->GenBuffers; var b: uint32 = (uint32)0; f(1, &b); return b; }
+fn glBindBuffer(t: uint32, b: uint32) { var f: fn(uint32, uint32) -> void = (fn(uint32, uint32) -> void)glp->BindBuffer; f(t, b); }
+fn glBufferData(t: uint32, bytes: int64, data: uint8*, usage: uint32) { var f: fn(uint32, int64, uint8*, uint32) -> void = (fn(uint32, int64, uint8*, uint32) -> void)glp->BufferData; f(t, bytes, data, usage); }
+fn glBufferSubData(t: uint32, off: int64, bytes: int64, data: uint8*) { var f: fn(uint32, int64, int64, uint8*) -> void = (fn(uint32, int64, int64, uint8*) -> void)glp->BufferSubData; glp->buf_bytes = glp->buf_bytes + bytes; f(t, off, bytes, data); }
+fn glEnableVertexAttribArray(i: uint32) { var f: fn(uint32) -> void = (fn(uint32) -> void)glp->EnableVertexAttribArray; f(i); }
+fn glVertexAttribPointer(i: uint32, sz: int32, typ: uint32, norm: uint8, stride: int32, off: int64) { var f: fn(uint32, int32, uint32, uint8, int32, int64) -> void = (fn(uint32, int32, uint32, uint8, int32, int64) -> void)glp->VertexAttribPointer; f(i, sz, typ, norm, stride, off); }
+fn glVertexAttribDivisor(i: uint32, d: uint32) { var f: fn(uint32, uint32) -> void = (fn(uint32, uint32) -> void)glp->VertexAttribDivisor; f(i, d); }
+fn glDrawElementsInstanced(mode: uint32, count: int32, typ: uint32, off: int64, n: int32) { var f: fn(uint32, int32, uint32, int64, int32) -> void = (fn(uint32, int32, uint32, int64, int32) -> void)glp->DrawElementsInstanced; f(mode, count, typ, off, n); }
+fn glDrawArraysInstanced(mode: uint32, first: int32, count: int32, n: int32) { var f: fn(uint32, int32, int32, int32) -> void = (fn(uint32, int32, int32, int32) -> void)glp->DrawArraysInstanced; f(mode, first, count, n); }
+fn glActiveTexture(t: uint32) { var f: fn(uint32) -> void = (fn(uint32) -> void)glp->ActiveTexture; f(t); }
+fn glGenerateMipmap(t: uint32) { var f: fn(uint32) -> void = (fn(uint32) -> void)glp->GenerateMipmap; f(t); }
+fn glGenFramebuffer() -> uint32 { var f: fn(int32, uint32*) -> void = (fn(int32, uint32*) -> void)glp->GenFramebuffers; var b: uint32 = (uint32)0; f(1, &b); return b; }
+fn glBindFramebuffer(t: uint32, b: uint32) { var f: fn(uint32, uint32) -> void = (fn(uint32, uint32) -> void)glp->BindFramebuffer; f(t, b); }
+fn glFramebufferTexture2D(t: uint32, att: uint32, tt: uint32, tex: uint32, lvl: int32) { var f: fn(uint32, uint32, uint32, uint32, int32) -> void = (fn(uint32, uint32, uint32, uint32, int32) -> void)glp->FramebufferTexture2D; f(t, att, tt, tex, lvl); }
+fn glCheckFramebufferStatus(t: uint32) -> uint32 { var f: fn(uint32) -> uint32 = (fn(uint32) -> uint32)glp->CheckFramebufferStatus; return f(t); }
+
+// ---------------------------------------------------------------- shaders
+fn gl_shader(kind: uint32, src: cstring, what: cstring) -> uint32 {
+  var s: uint32 = glCreateShader(kind);
+  glShaderSource1(s, src);
+  glCompileShader(s);
+  var ok: int32 = 0;
+  glGetShaderiv(s, GL_COMPILE_STATUS(), &ok);
+  if (ok == 0) {
+    var log: uint8* = (uint8*)malloc(4096);
+    var n: int32 = 0;
+    glGetShaderInfoLog(s, 4095, &n, log);
+    log[n] = (uint8)0;
+    print("shader compile failed: "); println_cstr(what);
+    println_cstr((cstring)log);
+    return (uint32)0;
+  }
+  return s;
+}
+
+// a fragment shader from two sources: the shared lighting (with the #version) and the shader's own body
+fn gl_shader2(kind: uint32, a: cstring, b: cstring, what: cstring) -> uint32 {
+  return gl_shader3(kind, a, b, "".chars, what);
+}
+// ... from three (a's the one with the #version)
+fn gl_shader3(kind: uint32, a: cstring, b: cstring, c: cstring, what: cstring) -> uint32 {
+  var s: uint32 = glCreateShader(kind);
+  var f: fn(uint32, int32, cstring*, int32*) -> void = (fn(uint32, int32, cstring*, int32*) -> void)glp->ShaderSource;
+  var srcs: cstring* = (cstring*)malloc(24);
+  srcs[0] = a;
+  srcs[1] = b;
+  srcs[2] = c;
+  f(s, 3, srcs, (int32*)0);
+  free((uint8*)srcs);
+  glCompileShader(s);
+  var ok: int32 = 0;
+  glGetShaderiv(s, GL_COMPILE_STATUS(), &ok);
+  if (ok == 0) {
+    var log: uint8* = (uint8*)malloc(4096);
+    var n: int32 = 0;
+    glGetShaderInfoLog(s, 4095, &n, log);
+    log[n] = (uint8)0;
+    print("shader compile failed: "); println_cstr(what);
+    println_cstr((cstring)log);
+    return (uint32)0;
+  }
+  return s;
+}
+
+// a program from a vertex + fragment source (the fragment's prefixed by `common` when it's given); the attribute
+// slots are bound by name before the link
+// a shader's source with its "#pragma ext" line (alone on it) replaced by ext: the engine's shaders take a game's
+// extensions there. The source as it is when it has none
+fn glsl_splice(src: cstring, ext: cstring) -> cstring {
+  var n: int64 = 0;
+  while (src[n] != (uint8)0) { n = n + 1; }
+  var m: int64 = 0;
+  while (ext[m] != (uint8)0) { m = m + 1; }
+  var mark: cstring = "
+#pragma ext
+".chars;
+  var at: int64 = -1;
+  var i: int64 = 0;
+  while (i + 13 <= n && at < 0) {
+    var k: int64 = 0;
+    while (k < 13 && src[i + k] == mark[k]) { k = k + 1; }
+    if (k == 13) { at = i; }
+    i = i + 1;
+  }
+  if (at < 0) { return src; }
+  var out: uint8* = (uint8*)malloc(n + m + 2);
+  i = 0;
+  while (i <= at) { out[i] = src[i]; i = i + 1; }               // (through the newline before the mark)
+  var j: int64 = 0;
+  while (j < m) { out[at + 1 + j] = ext[j]; j = j + 1; }
+  var o: int64 = at + 1 + m;
+  out[o] = (uint8)10; o = o + 1;
+  i = at + 13;
+  while (i < n) { out[o] = src[i]; o = o + 1; i = i + 1; }
+  out[o] = (uint8)0;
+  return (cstring)out;
+}
+
+// a shader library's source without its leading #version line (to go after another's)
+fn glsl_body(src: cstring) -> cstring {
+  var v: cstring = "#version".chars;
+  var k: int32 = 0;
+  while (k < 8 && src[k] == v[k]) { k = k + 1; }
+  if (k < 8) { return src; }
+  var i: int64 = 0;
+  while (src[i] != (uint8)0 && src[i] != (uint8)10) { i = i + 1; }
+  if (src[i] == (uint8)10) { i = i + 1; }
+  return (cstring)((uint8*)src + i);
+}
+
+// a string of two (a game's extension made of a library and its own)
+fn str_join(a: cstring, b: cstring) -> cstring {
+  var n: int64 = 0;
+  while (a[n] != (uint8)0) { n = n + 1; }
+  var m: int64 = 0;
+  while (b[m] != (uint8)0) { m = m + 1; }
+  var out: uint8* = (uint8*)malloc(n + m + 1);
+  var i: int64 = 0;
+  while (i < n) { out[i] = a[i]; i = i + 1; }
+  i = 0;
+  while (i < m) { out[n + i] = b[i]; i = i + 1; }
+  out[n + m] = (uint8)0;
+  return (cstring)out;
+}
+
+fn gl_program(vs: cstring, fs: cstring, what: cstring) -> uint32 { return gl_program_c(vs, (cstring)0, fs, what); }
+fn gl_program_c(vs: cstring, common: cstring, fs: cstring, what: cstring) -> uint32 {
+  var v: uint32 = gl_shader(GL_VERTEX_SHADER(), vs, what);
+  var f: uint32 = (uint32)0;
+  if (common != 0) { f = gl_shader2(GL_FRAGMENT_SHADER(), common, fs, what); }
+  else { f = gl_shader(GL_FRAGMENT_SHADER(), fs, what); }
+  return gl_link(v, f, what);
+}
+// a program whose two stages share a library (lib: no #version -- the vertex stage gets its own ahead of it)
+fn gl_program_lib(vs: cstring, common: cstring, lib: cstring, fs: cstring, what: cstring) -> uint32 {
+  var v: uint32 = gl_shader3(GL_VERTEX_SHADER(), "#version 330 core\n".chars, lib, vs, what);
+  var f: uint32 = gl_shader3(GL_FRAGMENT_SHADER(), common, lib, fs, what);
+  return gl_link(v, f, what);
+}
+fn gl_link(v: uint32, f: uint32, what: cstring) -> uint32 {
+  if (v == (uint32)0 || f == (uint32)0) { return (uint32)0; }
+  var p: uint32 = glCreateProgram();
+  glAttachShader(p, v);
+  glAttachShader(p, f);
+  glBindAttribLocation(p, (uint32)0, "aPos".chars);
+  glBindAttribLocation(p, (uint32)1, "aNrm".chars);
+  glBindAttribLocation(p, (uint32)2, "aUv".chars);
+  glBindAttribLocation(p, (uint32)3, "aJnt".chars);
+  glBindAttribLocation(p, (uint32)4, "aWgt".chars);
+  glBindAttribLocation(p, (uint32)5, "aCol".chars);
+  glBindAttribLocation(p, (uint32)0, "aPos".chars);
+  glBindAttribLocation(p, (uint32)6, "aInst0".chars);
+  glBindAttribLocation(p, (uint32)7, "aInst1".chars);
+  glBindAttribLocation(p, (uint32)8, "aEdge".chars);
+  glBindAttribLocation(p, (uint32)9, "aFlags".chars);
+  glBindAttribLocation(p, (uint32)10, "aShade".chars);
+  glBindAttribLocation(p, (uint32)11, "aI0".chars);
+  glBindAttribLocation(p, (uint32)12, "aI1".chars);
+  glBindAttribLocation(p, (uint32)13, "aI2".chars);
+  glBindAttribLocation(p, (uint32)14, "aI3".chars);
+  glBindAttribLocation(p, (uint32)15, "aI4".chars);
+  glLinkProgram(p);
+  var ok: int32 = 0;
+  glGetProgramiv(p, GL_LINK_STATUS(), &ok);
+  if (ok == 0) {
+    var log: uint8* = (uint8*)malloc(4096);
+    var n: int32 = 0;
+    glGetProgramInfoLog(p, 4095, &n, log);
+    log[n] = (uint8)0;
+    print("program link failed: "); println_cstr(what);
+    println_cstr((cstring)log);
+    return (uint32)0;
+  }
+  return p;
+}
+
+// an RGBA8 texture, mipmapped, repeating
+fn gl_texture_rgba(px: uint8*, w: int32, h: int32, repeat: int32) -> uint32 {
+  var t: uint32 = (uint32)0;
+  glGenTextures(1, &t);
+  glBindTexture(GL_TEXTURE_2D(), t);
+  glPixelStorei(GL_UNPACK_ALIGNMENT(), 1);
+  glTexImage2D(GL_TEXTURE_2D(), 0, GL_RGBA8(), w, h, 0, GL_RGBA(), GL_UNSIGNED_BYTE(), px);
+  glGenerateMipmap(GL_TEXTURE_2D());
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_MIN_FILTER(), GL_LINEAR_MIPMAP_LINEAR());
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_MAG_FILTER(), GL_LINEAR());
+  if (repeat != 0) {
+    glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_WRAP_S(), GL_REPEAT());
+    glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_WRAP_T(), GL_REPEAT());
+  } else {
+    glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_WRAP_S(), GL_CLAMP_TO_EDGE());
+    glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_WRAP_T(), GL_CLAMP_TO_EDGE());
+  }
+  return t;
+}
+
+fn gl_bind_tex(unit: int32, t: uint32) {
+  glp->n_texs = glp->n_texs + 1;
+  glActiveTexture(GL_TEXTURE0() + (uint32)unit);
+  glBindTexture(GL_TEXTURE_2D(), t);
+}
+
+// ---------------------------------------------------------------- GPU timestamps (GL_TIMESTAMP query objects)
+fn glGenQuery() -> uint32 { var f: fn(int32, uint32*) -> void = (fn(int32, uint32*) -> void)glp->GenQueries; var q: uint32 = (uint32)0; f(1, &q); return q; }
+fn glQueryTimestamp(q: uint32) { var f: fn(uint32, uint32) -> void = (fn(uint32, uint32) -> void)glp->QueryCounter; f(q, (uint32)0x8E28); }
+fn glQueryReady(q: uint32) -> int32 { var f: fn(uint32, uint32, int32*) -> void = (fn(uint32, uint32, int32*) -> void)glp->GetQueryObjectiv; var r: int32 = 0; f(q, (uint32)0x8867, &r); return r; }
+fn glQueryNs(q: uint32) -> int64 { var f: fn(uint32, uint32, int64*) -> void = (fn(uint32, uint32, int64*) -> void)glp->GetQueryObjectui64v; var r: int64 = 0; f(q, (uint32)0x8866, &r); return r; }
+
+// the G-buffer's targets: n colour attachments drawn at once
+fn glDrawBuffersN(n: int32) {
+  var f: fn(int32, uint32*) -> void = (fn(int32, uint32*) -> void)glp->DrawBuffers;
+  var b: uint32* = (uint32*)malloc(32);
+  var i: int32 = 0;
+  while (i < n) { b[i] = GL_COLOR_ATTACHMENT0() + (uint32)i; i = i + 1; }
+  f(n, b);
+  free((uint8*)b);
+}
+
+// a render target: a w x h texture of the given format, clamped, filtered nearest (read texel for texel)
+fn gl_target(ifmt: int32, fmt: uint32, typ: uint32, w: int32, h: int32) -> uint32 {
+  var t: uint32 = (uint32)0;
+  glGenTextures(1, &t);
+  glBindTexture(GL_TEXTURE_2D(), t);
+  glTexImage2D(GL_TEXTURE_2D(), 0, ifmt, w, h, 0, fmt, typ, (uint8*)0);
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_MIN_FILTER(), GL_NEAREST());
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_MAG_FILTER(), GL_NEAREST());
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_WRAP_S(), GL_CLAMP_TO_EDGE());
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_WRAP_T(), GL_CLAMP_TO_EDGE());
+  return t;
+}
+
+// ---------------------------------------------------------------- transform feedback, buffer textures, queries
+fn GL_TRANSFORM_FEEDBACK_BUFFER() -> uint32 { return 0x8C8E; }
+fn GL_TEXTURE_BUFFER() -> uint32 { return 0x8C2A; }
+fn GL_RASTERIZER_DISCARD() -> uint32 { return 0x8C89; }
+fn GL_TF_PRIMITIVES_WRITTEN() -> uint32 { return 0x8C88; }
+fn GL_POINTS() -> uint32 { return 0; }
+fn GL_GEOMETRY_SHADER() -> uint32 { return 0x8DD9; }
+fn GL_INT() -> uint32 { return 0x1404; }
+fn GL_RGBA32F() -> uint32 { return 0x8814; }
+fn GL_RGBA32I() -> uint32 { return 0x8D82; }
+fn GL_RG32I() -> uint32 { return 0x823B; }
+fn GL_R32I() -> uint32 { return 0x8235; }
+fn GL_R32F() -> uint32 { return 0x822E; }
+fn GL_RG16F() -> int32 { return 0x822F; }
+fn GL_MAX() -> uint32 { return 0x8008; }
+fn GL_FUNC_ADD() -> uint32 { return 0x8006; }
+fn GL_RG8() -> int32 { return 0x822B; }
+fn GL_RG() -> uint32 { return 0x8227; }
+
+fn glBeginTransformFeedback(mode: uint32) { var f: fn(uint32) -> void = (fn(uint32) -> void)glp->BeginTransformFeedback; f(mode); }
+fn glEndTransformFeedback() { var f: fn() -> void = (fn() -> void)glp->EndTransformFeedback; f(); }
+fn glBindBufferBase(t: uint32, i: uint32, b: uint32) { var f: fn(uint32, uint32, uint32) -> void = (fn(uint32, uint32, uint32) -> void)glp->BindBufferBase; f(t, i, b); }
+fn glBindBufferRange(t: uint32, i: uint32, b: uint32, off: int64, size: int64) { var f: fn(uint32, uint32, uint32, int64, int64) -> void = (fn(uint32, uint32, uint32, int64, int64) -> void)glp->BindBufferRange; f(t, i, b, off, size); }
+fn glTexBuffer(t: uint32, fmt: uint32, b: uint32) { var f: fn(uint32, uint32, uint32) -> void = (fn(uint32, uint32, uint32) -> void)glp->TexBuffer; f(t, fmt, b); }
+fn glGetBufferSubData(t: uint32, off: int64, size: int64, out: uint8*) { var f: fn(uint32, int64, int64, uint8*) -> void = (fn(uint32, int64, int64, uint8*) -> void)glp->GetBufferSubData; f(t, off, size, out); }
+fn glBeginQuery(t: uint32, q: uint32) { var f: fn(uint32, uint32) -> void = (fn(uint32, uint32) -> void)glp->BeginQuery; f(t, q); }
+fn glEndQuery(t: uint32) { var f: fn(uint32) -> void = (fn(uint32) -> void)glp->EndQuery; f(t); }
+fn glVertexAttribIPointer(i: uint32, sz: int32, typ: uint32, stride: int32, off: int64) { var f: fn(uint32, int32, uint32, int32, int64) -> void = (fn(uint32, int32, uint32, int32, int64) -> void)glp->VertexAttribIPointer; f(i, sz, typ, stride, off); }
+fn glBlendEquation(m: uint32) { var f: fn(uint32) -> void = (fn(uint32) -> void)glp->BlendEquation; f(m); }
+fn glBlendFuncSeparate(sc: uint32, dc: uint32, sa: uint32, da: uint32) { var f: fn(uint32, uint32, uint32, uint32) -> void = (fn(uint32, uint32, uint32, uint32) -> void)glp->BlendFuncSeparate; f(sc, dc, sa, da); }
+fn glQueryResult(q: uint32) -> int32 { var f: fn(uint32, uint32, int32*) -> void = (fn(uint32, uint32, int32*) -> void)glp->GetQueryObjectiv; var r: int32 = 0; f(q, (uint32)0x8866, &r); return r; }
+
+// a buffer texture over a buffer (texelFetch by index in a shader)
+fn gl_tbo(buf: uint32, fmt: uint32) -> uint32 {
+  var t: uint32 = (uint32)0;
+  glGenTextures(1, &t);
+  glBindTexture(GL_TEXTURE_BUFFER(), t);
+  glTexBuffer(GL_TEXTURE_BUFFER(), fmt, buf);
+  return t;
+}
+fn gl_bind_tbo(unit: int32, t: uint32) {
+  glp->n_texs = glp->n_texs + 1;
+  glActiveTexture(GL_TEXTURE0() + (uint32)unit);
+  glBindTexture(GL_TEXTURE_BUFFER(), t);
+}
+
+// a program whose output is captured (transform feedback): a vertex shader, an optional geometry shader, no fragment
+// shader (the rasterizer's off while it runs); one captured varying
+fn gl_program_tf(vs: cstring, gs: cstring, varying: cstring, what: cstring) -> uint32 {
+  var v: uint32 = gl_shader(GL_VERTEX_SHADER(), vs, what);
+  if (v == (uint32)0) { return (uint32)0; }
+  var p: uint32 = glCreateProgram();
+  glAttachShader(p, v);
+  if (gs != 0) {
+    var g: uint32 = gl_shader(GL_GEOMETRY_SHADER(), gs, what);
+    if (g == (uint32)0) { return (uint32)0; }
+    glAttachShader(p, g);
+  }
+  glBindAttribLocation(p, (uint32)0, "aPos".chars);
+  glBindAttribLocation(p, (uint32)3, "aJnt".chars);
+  glBindAttribLocation(p, (uint32)4, "aWgt".chars);
+  glBindAttribLocation(p, (uint32)8, "aEdge".chars);
+  glBindAttribLocation(p, (uint32)9, "aFlags".chars);
+  var f: fn(uint32, int32, cstring*, uint32) -> void = (fn(uint32, int32, cstring*, uint32) -> void)glp->TransformFeedbackVaryings;
+  var names: cstring* = (cstring*)malloc(8);
+  names[0] = varying;
+  f(p, 1, names, (uint32)0x8C8C);                                // (GL_INTERLEAVED_ATTRIBS)
+  free((uint8*)names);
+  glLinkProgram(p);
+  var ok: int32 = 0;
+  glGetProgramiv(p, GL_LINK_STATUS(), &ok);
+  if (ok == 0) {
+    var log: uint8* = (uint8*)malloc(4096);
+    var n: int32 = 0;
+    glGetProgramInfoLog(p, 4095, &n, log);
+    log[n] = (uint8)0;
+    print("program link failed: "); println_cstr(what);
+    println_cstr((cstring)log);
+    return (uint32)0;
+  }
+  return p;
+}

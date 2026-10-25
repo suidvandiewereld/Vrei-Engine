@@ -1,0 +1,314 @@
+import "std/io";
+import "std/mem";
+import "gl";
+import "math";
+
+extern fn c_fseek64(fp: cstring, off: int64, origin: int32) -> int32 = "_fseeki64";
+extern fn c_ftell64(fp: cstring) -> int64 = "_ftelli64";
+extern fn Win_GetModuleFileNameA(h: int64, buf: uint8*, n: uint32) -> uint32 = "GetModuleFileNameA";
+
+struct Skel {
+  nj: int32;
+  parent: int32*;
+  ibm: float32*;               // 16 a joint, column-major
+  rest: float32*;              // T xyz, R xyzw: 7 a joint
+  names: uint8*;               // 16 bytes a joint
+}
+
+struct Clip {
+  name: uint8*;                // 24 bytes, zero-padded
+  nf: int32;
+  fps: float64;
+  loop: int32;
+  dur: float64;                // (nf - 1) / fps
+  data: float32*;              // nf * nj * 7: T xyz, R xyzw
+}
+
+struct ClipSet { n: int32; nj: int32; clips: Clip*; }
+
+struct SkinMesh {
+  vao: uint32;
+  nsub: int32;
+  first: int32[4];
+  count: int32[4];
+  mat: int32[4];
+  ntex: int32;
+  tex: uint32[6];
+  flat: uint32[6];
+  vdat: uint8*; nv: int32;
+  idat: int32*; ni: int32;
+}
+
+struct StaticMesh {
+  vao: uint32;
+  count: int32;
+  tex: uint32;
+  flat: uint32;
+  xmin: float64;
+  xmax: float64;
+}
+
+struct Font {
+  tex: uint32;
+  cw: int32; ch: int32; cols: int32; rows: int32; aw: int32; ah: int32;
+}
+
+struct MeshSet { n: int32; names: uint8**; meshes: StaticMesh**; }
+
+var exe_dir: uint8* = 0;
+
+fn asset_path(name: cstring) -> cstring {
+  if (exe_dir == 0) {
+    exe_dir = (uint8*)malloc(1024);
+    var n: int32 = (int32)Win_GetModuleFileNameA(0, exe_dir, (uint32)1000);
+    while (n > 0 && exe_dir[n - 1] != (uint8)92 && exe_dir[n - 1] != (uint8)47) { n = n - 1; }
+    exe_dir[n] = (uint8)0;
+  }
+  var out: uint8* = (uint8*)malloc(1200);
+  var i: int32 = 0;
+  while (exe_dir[i] != (uint8)0) { out[i] = exe_dir[i]; i = i + 1; }
+  var pre: cstring = "assets\\".chars;
+  var k: int32 = 0;
+  while (pre[k] != (uint8)0) { out[i] = pre[k]; i = i + 1; k = k + 1; }
+  k = 0;
+  while (name[k] != (uint8)0) { out[i] = name[k]; i = i + 1; k = k + 1; }
+  out[i] = (uint8)0;
+  return out;
+}
+
+fn read_file(path: cstring, size: int64*) -> uint8* {
+  var fp: cstring = fopen(path, "rb".chars);
+  if (fp == 0) { print("can't open "); println_cstr(path); return (uint8*)0; }
+  c_fseek64(fp, 0, 2);
+  var n: int64 = c_ftell64(fp);
+  c_fseek64(fp, 0, 0);
+  var buf: uint8* = (uint8*)malloc(n + 1);
+  var got: int64 = fread(buf, 1, n, fp);
+  fclose(fp);
+  buf[n] = (uint8)0;
+  *size = got;
+  return buf;
+}
+
+fn rd_i32(p: uint8*, o: int64) -> int32 { return *(int32*)(p + o); }
+
+fn magic_ok(p: uint8*, m: cstring) -> int32 {
+  if (p[0] == m[0] && p[1] == m[1] && p[2] == m[2] && p[3] == m[3]) { return 1; }
+  return 0;
+}
+
+fn name_is(a: uint8*, b: cstring) -> int32 {
+  var i: int32 = 0;
+  while (b[i] != (uint8)0) {
+    if (a[i] != b[i]) { return 0; }
+    i = i + 1;
+  }
+  if (a[i] != (uint8)0) { return 0; }
+  return 1;
+}
+
+fn name_starts(a: uint8*, pre: cstring) -> int32 {
+  var i: int32 = 0;
+  while (pre[i] != (uint8)0) {
+    if (a[i] != pre[i]) { return 0; }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn skin_load(file: cstring, skel_out: Skel**) -> SkinMesh* {
+  var size: int64 = 0;
+  var p: uint8* = read_file(asset_path(file), &size);
+  if (p == 0 || magic_ok(p, "RFSK".chars) == 0) { return (SkinMesh*)0; }
+  var nj: int32 = rd_i32(p, 4);
+  var nv: int32 = rd_i32(p, 8);
+  var ni: int32 = rd_i32(p, 12);
+  var ns: int32 = rd_i32(p, 16);
+  var nt: int32 = rd_i32(p, 20);
+  var o: int64 = 24;
+  var S: Skel* = new Skel;
+  S->nj = nj;
+  S->parent = (int32*)(p + o); o = o + (int64)nj * 4;
+  S->ibm = (float32*)(p + o); o = o + (int64)nj * 64;
+  S->rest = (float32*)(p + o); o = o + (int64)nj * 28;
+  S->names = p + o; o = o + (int64)nj * 16;
+  *skel_out = S;
+  var M: SkinMesh* = new SkinMesh;
+  M->nsub = ns;
+  var i: int32 = 0;
+  while (i < ns && i < 4) {
+    M->first[i] = rd_i32(p, o);
+    M->count[i] = rd_i32(p, o + 4);
+    M->mat[i] = rd_i32(p, o + 8);
+    o = o + 12;
+    i = i + 1;
+  }
+  var verts: uint8* = p + o;
+  o = o + (int64)nv * 44;
+  var idx: uint8* = p + o;
+  o = o + (int64)ni * 4;
+  M->vao = glGenVertexArray();
+  glBindVertexArray(M->vao);
+  var vbo: uint32 = glGenBuffer();
+  glBindBuffer(GL_ARRAY_BUFFER(), vbo);
+  glBufferData(GL_ARRAY_BUFFER(), (int64)nv * 44, verts, GL_STATIC_DRAW());
+  var ibo: uint32 = glGenBuffer();
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER(), ibo);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER(), (int64)ni * 4, idx, GL_STATIC_DRAW());
+  glEnableVertexAttribArray((uint32)0);
+  glVertexAttribPointer((uint32)0, 3, GL_FLOAT(), (uint8)0, 44, 0);
+  glEnableVertexAttribArray((uint32)1);
+  glVertexAttribPointer((uint32)1, 3, GL_FLOAT(), (uint8)0, 44, 12);
+  glEnableVertexAttribArray((uint32)2);
+  glVertexAttribPointer((uint32)2, 2, GL_FLOAT(), (uint8)0, 44, 24);
+  glEnableVertexAttribArray((uint32)3);
+  glVertexAttribPointer((uint32)3, 4, GL_UNSIGNED_BYTE(), (uint8)0, 44, 32);
+  glEnableVertexAttribArray((uint32)4);
+  glVertexAttribPointer((uint32)4, 4, GL_UNSIGNED_BYTE(), (uint8)1, 44, 36);
+  glEnableVertexAttribArray((uint32)10);
+  glVertexAttribPointer((uint32)10, 4, GL_UNSIGNED_BYTE(), (uint8)1, 44, 40);
+  glBindVertexArray((uint32)0);
+  M->ntex = nt / 2;
+  if (M->ntex > 6) { M->ntex = 6; }
+  i = 0;
+  while (i < M->ntex * 2) {
+    var w: int32 = rd_i32(p, o);
+    var h: int32 = rd_i32(p, o + 4);
+    if (i < M->ntex) { M->tex[i] = gl_texture_rgba(p + o + 8, w, h, 1); }
+    else { M->flat[i - M->ntex] = gl_texture_rgba(p + o + 8, w, h, 1); }
+    o = o + 8 + (int64)w * (int64)h * 4;
+    i = i + 1;
+  }
+  M->vdat = verts; M->nv = nv; M->idat = (int32*)idx; M->ni = ni;
+  print_cstr(file); println(": {nj} joints, {nv} verts, {ni / 3} tris");
+  return M;
+}
+
+fn clips_load(file: cstring) -> ClipSet* {
+  var size: int64 = 0;
+  var p: uint8* = read_file(asset_path(file), &size);
+  if (p == 0 || magic_ok(p, "RFCL".chars) == 0) { return (ClipSet*)0; }
+  var CS: ClipSet* = new ClipSet;
+  CS->n = rd_i32(p, 4);
+  CS->nj = rd_i32(p, 8);
+  CS->clips = (Clip*)malloc((int64)CS->n * (int64)sizeof(Clip));
+  var o: int64 = 12;
+  var i: int32 = 0;
+  while (i < CS->n) {
+    var c: Clip* = &CS->clips[i];
+    c->name = p + o;
+    c->nf = rd_i32(p, o + 24);
+    c->fps = (float64)*(float32*)(p + o + 28);
+    c->loop = rd_i32(p, o + 32);
+    c->dur = (float64)(c->nf - 1) / c->fps;
+    c->data = (float32*)(p + o + 36);
+    o = o + 36 + (int64)c->nf * (int64)CS->nj * 28;
+    i = i + 1;
+  }
+  println("clips: {CS->n}");
+  return CS;
+}
+
+fn clip_find(CS: ClipSet*, name: cstring) -> int32 {
+  var i: int32 = 0;
+  while (i < CS->n) {
+    if (name_is(CS->clips[i].name, name) != 0) { return i; }
+    i = i + 1;
+  }
+  print("missing clip "); println_cstr(name);
+  return -1;
+}
+
+fn meshes_load(file: cstring) -> MeshSet* {
+  var size: int64 = 0;
+  var p: uint8* = read_file(asset_path(file), &size);
+  if (p == 0 || magic_ok(p, "RFGN".chars) == 0) { return (MeshSet*)0; }
+  var nt: int32 = rd_i32(p, 4);
+  var nm: int32 = rd_i32(p, 8);
+  var MS: MeshSet* = new MeshSet;
+  MS->n = nm;
+  MS->names = (uint8**)malloc((int64)nm * 8);
+  MS->meshes = (StaticMesh**)malloc((int64)nm * 8);
+  var o: int64 = 12;
+  var tex: uint32* = (uint32*)malloc(4 * 8);
+  var i: int32 = 0;
+  while (i < nt && i < 8) {
+    var w: int32 = rd_i32(p, o);
+    var h: int32 = rd_i32(p, o + 4);
+    tex[i] = gl_texture_rgba(p + o + 8, w, h, 1);
+    o = o + 8 + (int64)w * (int64)h * 4;
+    i = i + 1;
+  }
+  i = 0;
+  while (i < nm) {
+    var name: uint8* = p + o;
+    var nv: int32 = rd_i32(p, o + 16);
+    var ni: int32 = rd_i32(p, o + 20);
+    var ti: int32 = rd_i32(p, o + 24);
+    o = o + 28;
+    var G: StaticMesh* = new StaticMesh;
+    G->count = ni;
+    G->tex = tex[ti];
+    G->flat = tex[ti];
+    if (ti + 1 < nt) { G->flat = tex[ti + 1]; }
+    var verts: float32* = (float32*)(p + o);
+    G->xmin = 1000.0; G->xmax = -1000.0;
+    var k: int32 = 0;
+    while (k < nv) {
+      var x: float64 = (float64)verts[k * 8];
+      if (x < G->xmin) { G->xmin = x; }
+      if (x > G->xmax) { G->xmax = x; }
+      k = k + 1;
+    }
+    G->vao = glGenVertexArray();
+    glBindVertexArray(G->vao);
+    var vbo: uint32 = glGenBuffer();
+    glBindBuffer(GL_ARRAY_BUFFER(), vbo);
+    glBufferData(GL_ARRAY_BUFFER(), (int64)nv * 32, p + o, GL_STATIC_DRAW());
+    o = o + (int64)nv * 32;
+    var ibo: uint32 = glGenBuffer();
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER(), ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER(), (int64)ni * 4, p + o, GL_STATIC_DRAW());
+    o = o + (int64)ni * 4;
+    glEnableVertexAttribArray((uint32)0);
+    glVertexAttribPointer((uint32)0, 3, GL_FLOAT(), (uint8)0, 32, 0);
+    glEnableVertexAttribArray((uint32)1);
+    glVertexAttribPointer((uint32)1, 3, GL_FLOAT(), (uint8)0, 32, 12);
+    glEnableVertexAttribArray((uint32)2);
+    glVertexAttribPointer((uint32)2, 2, GL_FLOAT(), (uint8)0, 32, 24);
+    glBindVertexArray((uint32)0);
+    MS->names[i] = name;
+    MS->meshes[i] = G;
+    i = i + 1;
+  }
+  return MS;
+}
+
+fn mesh_find(MS: MeshSet*, name: cstring) -> StaticMesh* {
+  var i: int32 = 0;
+  while (i < MS->n) {
+    if (name_is(MS->names[i], name) != 0) { return MS->meshes[i]; }
+    i = i + 1;
+  }
+  return (StaticMesh*)0;
+}
+
+fn font_load(file: cstring) -> Font* {
+  var size: int64 = 0;
+  var p: uint8* = read_file(asset_path(file), &size);
+  if (p == 0 || magic_ok(p, "RFFN".chars) == 0) { return (Font*)0; }
+  var F: Font* = new Font;
+  F->cw = rd_i32(p, 4); F->ch = rd_i32(p, 8); F->cols = rd_i32(p, 12); F->rows = rd_i32(p, 16);
+  F->aw = rd_i32(p, 20); F->ah = rd_i32(p, 24);
+  var n: int32 = F->aw * F->ah;
+  var px: uint8* = (uint8*)malloc((int64)n * 4);
+  var i: int32 = 0;
+  while (i < n) {
+    px[i * 4] = (uint8)255; px[i * 4 + 1] = (uint8)255; px[i * 4 + 2] = (uint8)255; px[i * 4 + 3] = p[28 + i];
+    i = i + 1;
+  }
+  F->tex = gl_texture_rgba(px, F->aw, F->ah, 0);
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_MIN_FILTER(), GL_LINEAR());
+  return F;
+}
+

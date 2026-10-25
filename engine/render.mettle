@@ -1,0 +1,1003 @@
+// The renderer: OpenGL 3.3 core, everything on the GPU, PHOTOREAL. The sun's shadow map in two cascades (2048 each:
+// 7 m round the eye, 40 m beyond); the scene -- sky, blocks, skinned and static meshes, the ground last (its shader the
+// dearest: what's hidden of it never shaded) -- into a G-buffer of what each surface is (albedo + occlusion, normal +
+// roughness, object id / class / metalness / distance, the light it gives off); then its light (light_pass: ambient
+// occlusion, the sun, the sky -- shaders/ao.frag, shade.frag) into HDR, the effects drawn into that against the
+// scene's depth, and the lens and the film (final_pass: bloom, exposure, Reinhard, FXAA) onto the screen; the HUD over
+// it. The frame: shadow_begin x2 / draw_* / main_begin / draw_* / draw_ground / light_pass / fx_begin / fx /
+// final_pass / hud / present.
+// A GAME EXTENDS IT, never edits it: GLSL spliced into the engine's shaders (render_ext, before render_init: the
+// RX_* slots, each a set of functions the shader calls -- shaders/ext/ holds the defaults), and hooks called as it
+// draws (HK: its own uniforms on a skinned / static mesh, on the light pass; its own pass after the glow; its own
+// uniforms on the film). Object classes: 3 a block, 8 the ground; the game numbers the rest. GPU zones: the engine's
+// own (GZ_*), the game's defined with gz_define.
+import "std/io";
+import "std/mem";
+import "gl";
+import "math";
+import "assets";
+
+var SH_COMMON: string = import_str "shaders/common.glsl";
+var SH_SKIN_V: string = import_str "shaders/skin.vert";
+var SH_SKIN_SH_V: string = import_str "shaders/skin_shadow.vert";
+var SH_STATIC_V: string = import_str "shaders/static.vert";
+var SH_STATIC_SH_V: string = import_str "shaders/static_shadow.vert";
+var SH_DEPTH_F: string = import_str "shaders/depth.frag";
+var SH_TEX_F: string = import_str "shaders/textured.frag";
+var SH_BOX_F: string = import_str "shaders/box.frag";
+var SH_GROUND_V: string = import_str "shaders/ground.vert";
+var SH_GROUND_F: string = import_str "shaders/ground.frag";
+var SH_SKY_V: string = import_str "shaders/sky.vert";
+var SH_SKY_F: string = import_str "shaders/sky.frag";
+var SH_HUD_V: string = import_str "shaders/hud.vert";
+var SH_HUD_F: string = import_str "shaders/hud.frag";
+var SH_FX_V: string = import_str "shaders/fx.vert";
+var SH_FX_F: string = import_str "shaders/fx.frag";
+var SH_FINAL_F: string = import_str "shaders/final.frag";
+var SH_FXAA_F: string = import_str "shaders/fxaa.frag";
+var SH_AO_F: string = import_str "shaders/ao.frag";
+var SH_AOB_F: string = import_str "shaders/ao_blur.frag";
+var SH_SHADE_F: string = import_str "shaders/shade.frag";
+var SH_BDOWN_F: string = import_str "shaders/bloom_down.frag";
+var SH_BUP_F: string = import_str "shaders/bloom_up.frag";
+var SH_EXT_VERTEX: string = import_str "shaders/ext/vertex.glsl";
+var SH_EXT_DEPTH: string = import_str "shaders/ext/depth.glsl";
+var SH_EXT_SURFACE: string = import_str "shaders/ext/surface.glsl";
+var SH_EXT_LIGHT: string = import_str "shaders/ext/light.glsl";
+var SH_EXT_FINAL: string = import_str "shaders/ext/final.glsl";
+
+// the extension slots: where a game's GLSL goes (each shader's "#pragma ext")
+fn RX_SKIN_VS() -> int32 { return 0; }         // skin.vert: ext_vertex() (may #define MAX_BONES)
+fn RX_STATIC_VS() -> int32 { return 1; }       // static.vert: ext_vertex()
+fn RX_SURFACE_FS() -> int32 { return 2; }      // textured.frag: ext_clip(), ext_surface(...)
+fn RX_SKIN_SH_VS() -> int32 { return 3; }      // skin_shadow.vert: ext_vertex()
+fn RX_STATIC_SH_VS() -> int32 { return 4; }    // static_shadow.vert: ext_vertex()
+fn RX_DEPTH_FS() -> int32 { return 5; }        // depth.frag: ext_fragment()
+fn RX_LIGHT_FS() -> int32 { return 6; }        // shade.frag: ext_light_pre / _surface / _mirror / _ground_mask / _extra
+fn RX_FINAL_FS() -> int32 { return 7; }        // final.frag: ext_final_offset, ext_final
+var RX_SRC: cstring[8];
+var RX_SET: int32[8];
+fn render_ext(slot: int32, src: cstring) { RX_SRC[slot] = src; RX_SET[slot] = 1; }
+fn rx(slot: int32, dflt: string) -> cstring {
+  if (RX_SET[slot] != 0) { return RX_SRC[slot]; }
+  return dflt.chars;
+}
+
+// the hooks: what the game does as the engine draws (each a no-op until it's set)
+struct RenderHooks {
+  skin: fn(uint32) -> void;    // a skinned mesh's program in use, its uniforms set (R->shadow_pass: which)
+  stat: fn(uint32) -> void;    // a static mesh's
+  light: fn(uint32) -> void;   // the light pass's (texture units 6, 8..12 are the game's)
+  post: fn() -> void;          // after the glow, before the film: a pass of its own (R->empty_vao, tgt_make, fs_into)
+  film: fn(uint32) -> void;    // the film's program in use (texture units 4..7 are the game's)
+}
+var HK: RenderHooks* = 0;
+fn hook_nop_p(p: uint32) { }
+fn hook_nop() { }
+fn render_hooks() -> RenderHooks* {
+  if (HK == 0) {
+    HK = new RenderHooks;
+    HK->skin = hook_nop_p; HK->stat = hook_nop_p; HK->light = hook_nop_p; HK->post = hook_nop; HK->film = hook_nop_p;
+  }
+  return HK;
+}
+
+fn SHADOW_N() -> int32 { return 2048; }             // a cascade of the sun's shadow map (texels a side)
+fn CASC0() -> float64 { return 7.0; }             // the near cascade's half width (m)
+fn CASC1() -> float64 { return 40.0; }            // the far one's
+fn QUAD_CAP() -> int32 { return 8192; }           // HUD / FX quads a frame
+fn QV_FLOATS() -> int32 { return 9; }             // a quad vertex: x y z, u v, r g b a
+fn NBLOOM() -> int32 { return 6; }                // the glow's chain: half size down to a 64th
+
+// a render target for the frame's passes: one RGBA16F texture, its framebuffer
+struct Tgt { fbo: uint32; tex: uint32; w: int32; h: int32; }
+
+struct Renderer {
+  p_skin: uint32; p_skin_sh: uint32; p_tex: uint32; p_static_sh: uint32; p_box: uint32;
+  p_ground: uint32; p_sky: uint32; p_hud: uint32; p_fx: uint32;
+  // the frame's passes: the occlusion and its blur, the light, the glow's chain, the lens and the film, FXAA
+  p_ao: uint32; p_aob: uint32; p_shade: uint32; p_bdown: uint32; p_bup: uint32; p_final: uint32; p_fxaa: uint32;
+  t_ao: Tgt; t_ao2: Tgt;       // the occlusion (r), the distance (g)
+  t_hdr: Tgt[2];               // the scene's light: this frame's, last frame's (the wet surfaces reflect it)
+  hdr_i: int32;                // which is this frame's
+  fx_fbo: uint32[2];           // each, with the G-buffer's depth (the effects drawn into it, tested against the scene)
+  t_ldr: Tgt;                  // the display colour, before FXAA
+  t_bloom: Tgt[6];
+  empty_vao: uint32;           // (draws made from gl_VertexID alone)
+  bloom: float64;              // how much of the glow
+  exposure: float64;
+  // the G-buffer: 0 albedo + occlusion (RGBA8), 1 normal + roughness (RGBA16F), 2 id / class / metalness / distance
+  // (RGBA16F), 3 the light given off (RGBA8); its depth
+  gfbo: uint32; gtex: uint32[4]; gdepth: uint32; gw: int32; gh: int32;
+  time: float64;               // seconds (the comic's embers, its grain)
+  shadow_fbo: uint32; shadow_tex: uint32;
+  ground_vao: uint32; cube_vao: uint32; sky_vao: uint32;
+  hud_vao: uint32; hud_vbo: uint32; fx_vao: uint32; fx_vbo: uint32;
+  hud: float32*; hud_n: int32;
+  fx: float32*; fx_n: int32;
+  vp: float32[16];             // the camera's view-projection
+  inv_vp: float32[16];
+  light_vp: float32[32];       // the sun's two cascades
+  casc: int32;                 // the one being drawn
+  prev_vp: float32[16];        // last frame's view-projection
+  cam: Vec3; cam_rot: Quat;
+  w: int32; h: int32;
+  p11: float64;                // the projection's y scale (pixels a metre at 1 m: h / 2 x p11)
+  shadow_pass: int32;          // 1 while drawing into the shadow map
+  sun: Vec3;
+  font: Font*;                 // the HUD's
+  // GPU time: GL_TIMESTAMP queries -- one as the frame's GPU work starts, then one as each stretch of it ends, with
+  // what that stretch was (its zone, GZ_*); a ring of 4 frames read 3 behind so nothing waits on the GPU
+  tq: uint32[96];
+  tq_z: int32[96];
+  tq_n: int32[4];
+  tq_frame: int32;
+  gz_raw: float64[24];         // each zone's time (ms) in the frame read back; eased (to be read)
+  gz_ms: float64[24];
+  gz_label: cstring[24];       // each zone's name, what it counts toward (gpu_ms); how many there are
+  gz_cat: int32[24];
+  gz_n: int32;
+  gpu_ms: float64[5];          // shadow, scene, post, fx, hud
+  gpu_total: float64;
+  frame_n: int32;
+}
+
+var R: Renderer* = 0;
+
+fn uloc(p: uint32, n: string) -> int32 { return glGetUniformLocation(p, n.chars); }
+
+fn quad_vao(vbo_out: uint32*) -> uint32 {
+  var vao: uint32 = glGenVertexArray();
+  glBindVertexArray(vao);
+  var vbo: uint32 = glGenBuffer();
+  glBindBuffer(GL_ARRAY_BUFFER(), vbo);
+  glBufferData(GL_ARRAY_BUFFER(), (int64)QUAD_CAP() * 6 * (int64)QV_FLOATS() * 4, (uint8*)0, GL_STREAM_DRAW());
+  glEnableVertexAttribArray((uint32)0);
+  glVertexAttribPointer((uint32)0, 3, GL_FLOAT(), (uint8)0, 36, 0);
+  glEnableVertexAttribArray((uint32)2);
+  glVertexAttribPointer((uint32)2, 2, GL_FLOAT(), (uint8)0, 36, 12);
+  glEnableVertexAttribArray((uint32)5);
+  glVertexAttribPointer((uint32)5, 4, GL_FLOAT(), (uint8)0, 36, 20);
+  glBindVertexArray((uint32)0);
+  *vbo_out = vbo;
+  return vao;
+}
+
+// a unit cube (-0.5..0.5), its faces' normals, uvs
+fn cube_vao() -> uint32 {
+  var v: float32* = (float32*)malloc(36 * 8 * 4);
+  // each face: normal axis a, sign s; two triangles
+  var n: int32 = 0;
+  var face: int32 = 0;
+  while (face < 6) {
+    var ax: int32 = face / 2;
+    var sg: float64 = 1.0;
+    if (face % 2 == 1) { sg = -1.0; }
+    var k: int32 = 0;
+    while (k < 6) {
+      // the quad's corners (u, v) in -0.5..0.5, wound counter-clockwise seen from outside
+      // (two triangles: (-,-) (+,-) (+,+) and (-,-) (+,+) (-,+))
+      var cu: float64 = -0.5; var cv: float64 = -0.5;
+      if (k == 1) { cu = 0.5; cv = -0.5; }
+      if (k == 2 || k == 4) { cu = 0.5; cv = 0.5; }
+      if (k == 5) { cu = -0.5; cv = 0.5; }
+      if (sg < 0.0) { var tmp: float64 = cu; cu = cv; cv = tmp; }
+      var px: float64 = 0.0; var py: float64 = 0.0; var pz: float64 = 0.0;
+      if (ax == 0) { px = 0.5 * sg; py = cu; pz = cv; }
+      if (ax == 1) { py = 0.5 * sg; pz = cu; px = cv; }
+      if (ax == 2) { pz = 0.5 * sg; px = cu; py = cv; }
+      var o: int32 = n * 8;
+      v[o] = (float32)px; v[o + 1] = (float32)py; v[o + 2] = (float32)pz;
+      v[o + 3] = 0.0; v[o + 4] = 0.0; v[o + 5] = 0.0;
+      if (ax == 0) { v[o + 3] = (float32)sg; }
+      if (ax == 1) { v[o + 4] = (float32)sg; }
+      if (ax == 2) { v[o + 5] = (float32)sg; }
+      v[o + 6] = (float32)(cu + 0.5); v[o + 7] = (float32)(cv + 0.5);
+      n = n + 1;
+      k = k + 1;
+    }
+    face = face + 1;
+  }
+  var vao: uint32 = glGenVertexArray();
+  glBindVertexArray(vao);
+  var vbo: uint32 = glGenBuffer();
+  glBindBuffer(GL_ARRAY_BUFFER(), vbo);
+  glBufferData(GL_ARRAY_BUFFER(), 36 * 32, (uint8*)v, GL_STATIC_DRAW());
+  glEnableVertexAttribArray((uint32)0);
+  glVertexAttribPointer((uint32)0, 3, GL_FLOAT(), (uint8)0, 32, 0);
+  glEnableVertexAttribArray((uint32)1);
+  glVertexAttribPointer((uint32)1, 3, GL_FLOAT(), (uint8)0, 32, 12);
+  glEnableVertexAttribArray((uint32)2);
+  glVertexAttribPointer((uint32)2, 2, GL_FLOAT(), (uint8)0, 32, 24);
+  glBindVertexArray((uint32)0);
+  free((uint8*)v);
+  return vao;
+}
+
+fn pos_vao(v: float32*, n: int32) -> uint32 {
+  var vao: uint32 = glGenVertexArray();
+  glBindVertexArray(vao);
+  var vbo: uint32 = glGenBuffer();
+  glBindBuffer(GL_ARRAY_BUFFER(), vbo);
+  glBufferData(GL_ARRAY_BUFFER(), (int64)n * 12, (uint8*)v, GL_STATIC_DRAW());
+  glEnableVertexAttribArray((uint32)0);
+  glVertexAttribPointer((uint32)0, 3, GL_FLOAT(), (uint8)0, 12, 0);
+  glBindVertexArray((uint32)0);
+  return vao;
+}
+
+// a program from an engine vertex / fragment pair, each with its extension spliced in (the fragment after common)
+fn prog_x(vs: string, vx: cstring, common: cstring, fs: string, fx: cstring, what: cstring) -> uint32 {
+  return gl_program_c(glsl_splice(vs.chars, vx), common, glsl_splice(fs.chars, fx), what);
+}
+
+fn render_init(font: Font*, w: int32, h: int32) -> int32 {
+  R = new Renderer;
+  R->font = font;
+  render_hooks();
+  gz_engine();
+  R->w = w; R->h = h;
+  var C: cstring = SH_COMMON.chars;
+  var surf: cstring = rx(RX_SURFACE_FS(), SH_EXT_SURFACE);
+  var depth: cstring = rx(RX_DEPTH_FS(), SH_EXT_DEPTH);
+  R->p_skin = prog_x(SH_SKIN_V, rx(RX_SKIN_VS(), SH_EXT_VERTEX), C, SH_TEX_F, surf, "skin".chars);
+  R->p_skin_sh = prog_x(SH_SKIN_SH_V, rx(RX_SKIN_SH_VS(), SH_EXT_VERTEX), (cstring)0, SH_DEPTH_F, depth, "skin shadow".chars);
+  R->p_tex = prog_x(SH_STATIC_V, rx(RX_STATIC_VS(), SH_EXT_VERTEX), C, SH_TEX_F, surf, "static".chars);
+  R->p_static_sh = prog_x(SH_STATIC_SH_V, rx(RX_STATIC_SH_VS(), SH_EXT_VERTEX), (cstring)0, SH_DEPTH_F, depth, "static shadow".chars);
+  R->p_box = gl_program_c(glsl_splice(SH_STATIC_V.chars, rx(RX_STATIC_VS(), SH_EXT_VERTEX)), C, SH_BOX_F.chars, "box".chars);
+  R->p_ground = gl_program_c(SH_GROUND_V.chars, C, SH_GROUND_F.chars, "ground".chars);
+  R->p_sky = gl_program_c(SH_SKY_V.chars, C, SH_SKY_F.chars, "sky".chars);
+  R->p_hud = gl_program(SH_HUD_V.chars, SH_HUD_F.chars, "hud".chars);
+  R->p_fx = gl_program(SH_FX_V.chars, SH_FX_F.chars, "fx".chars);
+  R->p_final = gl_program(SH_SKY_V.chars, glsl_splice(SH_FINAL_F.chars, rx(RX_FINAL_FS(), SH_EXT_FINAL)), "final".chars);
+  R->p_fxaa = gl_program(SH_SKY_V.chars, SH_FXAA_F.chars, "fxaa".chars);
+  R->p_ao = gl_program(SH_SKY_V.chars, SH_AO_F.chars, "ao".chars);
+  R->p_aob = gl_program(SH_SKY_V.chars, SH_AOB_F.chars, "ao blur".chars);
+  R->empty_vao = glGenVertexArray();
+  R->p_shade = gl_program(SH_SKY_V.chars, glsl_splice(SH_SHADE_F.chars, rx(RX_LIGHT_FS(), SH_EXT_LIGHT)), "shade".chars);
+  R->p_bdown = gl_program(SH_SKY_V.chars, SH_BDOWN_F.chars, "bloom down".chars);
+  R->p_bup = gl_program(SH_SKY_V.chars, SH_BUP_F.chars, "bloom up".chars);
+  R->bloom = 0.045;
+  R->exposure = 1.0;
+  if (R->p_skin == (uint32)0 || R->p_skin_sh == (uint32)0 || R->p_tex == (uint32)0 || R->p_static_sh == (uint32)0
+      || R->p_box == (uint32)0 || R->p_ground == (uint32)0 || R->p_sky == (uint32)0 || R->p_hud == (uint32)0
+      || R->p_fx == (uint32)0 || R->p_final == (uint32)0 || R->p_shade == (uint32)0
+      || R->p_fxaa == (uint32)0 || R->p_ao == (uint32)0 || R->p_aob == (uint32)0 || R->p_bdown == (uint32)0 || R->p_bup == (uint32)0) {
+    return 0;
+  }
+  // the shadow map: a depth texture compared on lookup, its two cascades side by side
+  glGenTextures(1, &R->shadow_tex);
+  glBindTexture(GL_TEXTURE_2D(), R->shadow_tex);
+  glTexImage2D(GL_TEXTURE_2D(), 0, GL_DEPTH_COMPONENT24(), SHADOW_N() * 2, SHADOW_N(), 0, GL_DEPTH_COMPONENT(), GL_FLOAT(), (uint8*)0);
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_MIN_FILTER(), GL_LINEAR());
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_MAG_FILTER(), GL_LINEAR());
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_WRAP_S(), GL_CLAMP_TO_EDGE());
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_WRAP_T(), GL_CLAMP_TO_EDGE());
+  glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_COMPARE_MODE(), GL_COMPARE_REF_TO_TEXTURE());
+  R->shadow_fbo = glGenFramebuffer();
+  glBindFramebuffer(GL_FRAMEBUFFER(), R->shadow_fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER(), GL_DEPTH_ATTACHMENT(), GL_TEXTURE_2D(), R->shadow_tex, 0);
+  glDrawBuffer(GL_NONE());
+  glReadBuffer(GL_NONE());
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER()) != GL_FRAMEBUFFER_COMPLETE()) { println("shadow framebuffer incomplete"); }
+  glBindFramebuffer(GL_FRAMEBUFFER(), (uint32)0);
+  // the ground: one big quad (the grid and the noise are the shader's)
+  var g: float32* = (float32*)malloc(6 * 12);
+  var S: float32 = 600.0;
+  g[0] = -S; g[1] = 0.0; g[2] = -S;   g[3] = -S; g[4] = 0.0; g[5] = S;    g[6] = S; g[7] = 0.0; g[8] = S;
+  g[9] = -S; g[10] = 0.0; g[11] = -S; g[12] = S; g[13] = 0.0; g[14] = S;  g[15] = S; g[16] = 0.0; g[17] = -S;
+  R->ground_vao = pos_vao(g, 6);
+  var s: float32* = (float32*)malloc(3 * 12);
+  s[0] = -1.0; s[1] = -1.0; s[2] = 0.0;  s[3] = 3.0; s[4] = -1.0; s[5] = 0.0;  s[6] = -1.0; s[7] = 3.0; s[8] = 0.0;
+  R->sky_vao = pos_vao(s, 3);
+  R->cube_vao = cube_vao();
+  R->hud_vao = quad_vao(&R->hud_vbo);
+  R->fx_vao = quad_vao(&R->fx_vbo);
+  R->hud = (float32*)malloc((int64)QUAD_CAP() * 6 * (int64)QV_FLOATS() * 4);
+  R->fx = (float32*)malloc((int64)QUAD_CAP() * 6 * (int64)QV_FLOATS() * 4);
+  R->sun = vunit(v3(-0.55, 0.42, -0.72));
+  var q: int32 = 0;
+  while (q < 96) { R->tq[q] = glGenQuery(); q = q + 1; }
+  glEnable(GL_MULTISAMPLE());
+  return 1;
+}
+
+// the GPU's zones: the stretches of the frame its time is put down to (in the order they come). The engine's own here;
+// a game's in the numbers between (gz_define), each counted toward one of gpu_ms's five: 0 shadow, 1 scene, 2 post,
+// 3 fx, 4 hud
+fn GZ_SHADOW() -> int32 { return 0; }
+fn GZ_SKY() -> int32 { return 1; }
+fn GZ_AO() -> int32 { return 8; }
+fn GZ_LIGHT() -> int32 { return 9; }
+fn GZ_FX() -> int32 { return 10; }
+fn GZ_BLOOM() -> int32 { return 12; }
+fn GZ_FINAL() -> int32 { return 14; }
+fn GZ_AA() -> int32 { return 15; }
+fn GZ_HUD() -> int32 { return 16; }
+fn GZ_MAX() -> int32 { return 24; }
+fn GZ_N() -> int32 { return R->gz_n; }
+fn gz_define(z: int32, name: cstring, cat: int32) {
+  R->gz_label[z] = name;
+  R->gz_cat[z] = cat;
+  if (z + 1 > R->gz_n) { R->gz_n = z + 1; }
+}
+fn gz_engine() {
+  var z: int32 = 0;
+  while (z < GZ_MAX()) { R->gz_label[z] = "hud".chars; R->gz_cat[z] = 4; z = z + 1; }
+  gz_define(GZ_SHADOW(), "shadow maps (2 cascades)".chars, 0);
+  gz_define(GZ_SKY(), "sky + ground".chars, 1);
+  gz_define(GZ_AO(), "ambient occlusion".chars, 2);
+  gz_define(GZ_LIGHT(), "lighting (sun, sky)".chars, 2);
+  gz_define(GZ_FX(), "world fx".chars, 3);
+  gz_define(GZ_BLOOM(), "bloom".chars, 2);
+  gz_define(GZ_FINAL(), "lens + film (Reinhard)".chars, 2);
+  gz_define(GZ_AA(), "anti-aliasing (FXAA)".chars, 2);
+  gz_define(GZ_HUD(), "hud".chars, 4);
+}
+fn gz_name(z: int32) -> cstring { return R->gz_label[z]; }
+// the frame's GPU work starts (the shadow map); a stretch of it ends, zone z (gpu_zone: not while drawing the shadow
+// map -- all of that is its own zone)
+fn gpu_start() {
+  var f: int32 = R->frame_n % 4;
+  glQueryTimestamp(R->tq[f * 24]);
+  R->tq_z[f * 24] = -1;
+  R->tq_n[f] = 1;
+}
+fn gpu_end(z: int32) {
+  var f: int32 = R->frame_n % 4;
+  var n: int32 = R->tq_n[f];
+  if (n == 0 || n >= 24) { return; }
+  glQueryTimestamp(R->tq[f * 24 + n]);
+  R->tq_z[f * 24 + n] = z;
+  R->tq_n[f] = n + 1;
+}
+fn gpu_zone(z: int32) { if (R->shadow_pass == 0) { gpu_end(z); } }
+
+// the frame begins: read back the slot from three frames ago (if the GPU's done with it) -- each zone's time, the
+// old five (shadow, scene, post, fx, hud), the total
+fn frame_begin() {
+  gl_stats_reset();
+  if (R->frame_n >= 3) {
+    var f: int32 = (R->frame_n + 1) % 4;
+    var n: int32 = R->tq_n[f];
+    if (n > 1 && glQueryReady(R->tq[f * 24 + n - 1]) != 0) {
+      var z: int32 = 0;
+      while (z < GZ_N()) { R->gz_raw[z] = 0.0; z = z + 1; }
+      var t0: int64 = glQueryNs(R->tq[f * 24]);
+      var prev: int64 = t0;
+      var i: int32 = 1;
+      while (i < n) {
+        var t: int64 = glQueryNs(R->tq[f * 24 + i]);
+        var zi: int32 = R->tq_z[f * 24 + i];
+        R->gz_raw[zi] = R->gz_raw[zi] + (float64)(t - prev) / 1000000.0;
+        prev = t;
+        i = i + 1;
+      }
+      R->gpu_total = (float64)(prev - t0) / 1000000.0;
+      z = 0;
+      while (z < GZ_N()) { R->gz_ms[z] = lerpf(R->gz_ms[z], R->gz_raw[z], 0.1); z = z + 1; }
+      var g: int32 = 0;
+      while (g < 5) { R->gpu_ms[g] = 0.0; g = g + 1; }
+      z = 0;
+      while (z < GZ_N()) { R->gpu_ms[R->gz_cat[z]] = R->gpu_ms[R->gz_cat[z]] + R->gz_raw[z]; z = z + 1; }
+    }
+  }
+  R->tq_n[R->frame_n % 4] = 0;
+}
+fn frame_end() { gpu_end(GZ_HUD()); R->frame_n = R->frame_n + 1; }
+
+// the G-buffer at the window's size (rebuilt when it changes)
+fn gbuf_ensure(w: int32, h: int32) {
+  if (R->gfbo != (uint32)0 && R->gw == w && R->gh == h) { return; }
+  if (R->gfbo == (uint32)0) { R->gfbo = glGenFramebuffer(); }
+  R->gw = w; R->gh = h;
+  R->gtex[0] = gl_target(GL_RGBA8(), GL_RGBA(), GL_UNSIGNED_BYTE(), w, h);
+  R->gtex[1] = gl_target(GL_RGBA16F(), GL_RGBA(), GL_HALF_FLOAT(), w, h);
+  R->gtex[2] = gl_target(GL_RGBA16F(), GL_RGBA(), GL_HALF_FLOAT(), w, h);
+  R->gtex[3] = gl_target(GL_RGBA8(), GL_RGBA(), GL_UNSIGNED_BYTE(), w, h);
+  R->gdepth = gl_target(GL_DEPTH_COMPONENT24(), GL_DEPTH_COMPONENT(), GL_FLOAT(), w, h);
+  glBindFramebuffer(GL_FRAMEBUFFER(), R->gfbo);
+  var i: int32 = 0;
+  while (i < 4) {
+    glFramebufferTexture2D(GL_FRAMEBUFFER(), GL_COLOR_ATTACHMENT0() + (uint32)i, GL_TEXTURE_2D(), R->gtex[i], 0);
+    i = i + 1;
+  }
+  glFramebufferTexture2D(GL_FRAMEBUFFER(), GL_DEPTH_ATTACHMENT(), GL_TEXTURE_2D(), R->gdepth, 0);
+  glDrawBuffersN(4);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER()) != GL_FRAMEBUFFER_COMPLETE()) { println("G-buffer incomplete"); }
+}
+
+// ---------------------------------------------------------------- the frame's passes
+fn tgt_make(T: Tgt*, w: int32, h: int32, linear: int32) {
+  if (T->fbo != (uint32)0 && T->w == w && T->h == h) { return; }
+  if (T->fbo == (uint32)0) { T->fbo = glGenFramebuffer(); }
+  T->w = w; T->h = h;
+  T->tex = gl_target(GL_RGBA16F(), GL_RGBA(), GL_HALF_FLOAT(), w, h);
+  if (linear != 0) {
+    glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_MIN_FILTER(), GL_LINEAR());
+    glTexParameteri(GL_TEXTURE_2D(), GL_TEXTURE_MAG_FILTER(), GL_LINEAR());
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER(), T->fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER(), GL_COLOR_ATTACHMENT0(), GL_TEXTURE_2D(), T->tex, 0);
+  glDrawBuffersN(1);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER()) != GL_FRAMEBUFFER_COMPLETE()) { println("pass target incomplete"); }
+}
+
+// a full-screen pass into a target (0: the screen)
+fn fs_into(T: Tgt*) {
+  if (T == (Tgt*)0) {
+    glBindFramebuffer(GL_FRAMEBUFFER(), (uint32)0);
+    glViewport(0, 0, R->w, R->h);
+  } else {
+    glBindFramebuffer(GL_FRAMEBUFFER(), T->fbo);
+    glViewport(0, 0, T->w, T->h);
+  }
+}
+fn fs_draw() {
+  glBindVertexArray(R->sky_vao);
+  glDrawArrays(GL_TRIANGLES(), 0, 3);
+  gl_count_draw(3);
+  glp->n_passes = glp->n_passes + 1;
+}
+
+// the scene's light targets: two (this frame's, last frame's), each with a framebuffer that also tests against the
+// G-buffer's depth (the effects drawn into it); cleared when made
+fn hdr_ensure(w: int32, h: int32) {
+  var k: int32 = 0;
+  while (k < 2) {
+    var T: Tgt* = &R->t_hdr[k];
+    if (T->fbo == (uint32)0 || T->w != w || T->h != h) {
+      tgt_make(T, w, h, 1);
+      glClearColor(0.0, 0.0, 0.0, 0.0);
+      glClear(GL_COLOR_BUFFER_BIT());
+      if (R->fx_fbo[k] == (uint32)0) { R->fx_fbo[k] = glGenFramebuffer(); }
+    }
+    k = k + 1;
+  }
+}
+
+// THE LIGHT, after the G-buffer:
+//   occlusion  how much of the sky each point's surroundings hide (shaders/ao.frag), smoothed across its surface
+//   light      the sun through its cascades, the sky, the haze, what the game lays over it (shaders/shade.frag) -> HDR
+fn light_pass() {
+  var w: int32 = R->w;
+  var h: int32 = R->h;
+  glDisable(GL_DEPTH_TEST());
+  glDepthMask((uint8)0);
+  glDisable(GL_BLEND());
+  hdr_ensure(w, h);
+  tgt_make(&R->t_ao, w, h, 0);
+  tgt_make(&R->t_ao2, w, h, 0);
+  // ---- the occlusion, then smoothed both ways
+  fs_into(&R->t_ao);
+  var p: uint32 = R->p_ao;
+  glUseProgram(p);
+  gl_bind_tex(2, R->gdepth);
+  gl_bind_tex(3, R->gtex[1]);
+  gl_bind_tex(4, R->gtex[2]);
+  glUniform1i(uloc(p, "uDepthT"), 2);
+  glUniform1i(uloc(p, "uNrmT"), 3);
+  glUniform1i(uloc(p, "uObjT"), 4);
+  glUniformMatrix4fv(uloc(p, "uInvVP"), 1, &R->inv_vp[0]);
+  glUniform2f(uloc(p, "uScreen"), (float32)w, (float32)h);
+  glUniform1f(uloc(p, "uP11"), (float32)R->p11);
+  fs_draw();
+  p = R->p_aob;
+  glUseProgram(p);
+  glUniform1i(uloc(p, "uSrc"), 2);
+  glUniform2f(uloc(p, "uScreen"), (float32)w, (float32)h);
+  fs_into(&R->t_ao2);
+  gl_bind_tex(2, R->t_ao.tex);
+  glUniform2f(uloc(p, "uDir"), 1.0, 0.0);
+  fs_draw();
+  fs_into(&R->t_ao);
+  gl_bind_tex(2, R->t_ao2.tex);
+  glUniform2f(uloc(p, "uDir"), 0.0, 1.0);
+  fs_draw();
+  gpu_end(GZ_AO());
+  // ---- the light
+  var cur: int32 = R->hdr_i;
+  fs_into(&R->t_hdr[cur]);
+  p = R->p_shade;
+  glUseProgram(p);
+  set_light(p);
+  var i: int32 = 0;
+  while (i < 4) { gl_bind_tex(2 + i, R->gtex[i]); i = i + 1; }
+  glUniform1i(uloc(p, "uAlbT"), 2);
+  glUniform1i(uloc(p, "uNrmT"), 3);
+  glUniform1i(uloc(p, "uObjT"), 4);
+  glUniform1i(uloc(p, "uEmiT"), 5);
+  gl_bind_tex(7, R->gdepth);
+  glUniform1i(uloc(p, "uDepthT"), 7);
+  gl_bind_tex(13, R->t_ao.tex);
+  glUniform1i(uloc(p, "uAOT"), 13);
+  gl_bind_tex(14, R->t_hdr[1 - cur].tex);
+  glUniform1i(uloc(p, "uPrevT"), 14);
+  gl_bind_tex(15, R->shadow_tex);
+  glUniform1i(uloc(p, "uShadow"), 15);
+  glUniformMatrix4fv(uloc(p, "uLightVP0"), 1, &R->light_vp[0]);
+  glUniformMatrix4fv(uloc(p, "uLightVP1"), 1, &R->light_vp[16]);
+  glUniform2f(uloc(p, "uCascTexel"), (float32)(CASC0() * 2.0 / (float64)SHADOW_N()), (float32)(CASC1() * 2.0 / (float64)SHADOW_N()));
+  glUniform2f(uloc(p, "uScreen"), (float32)w, (float32)h);
+  glUniformMatrix4fv(uloc(p, "uVP"), 1, &R->vp[0]);
+  glUniformMatrix4fv(uloc(p, "uInvVP"), 1, &R->inv_vp[0]);
+  glUniformMatrix4fv(uloc(p, "uPrevVP"), 1, &R->prev_vp[0]);
+  HK->light(p);
+  fs_draw();
+  gpu_end(GZ_LIGHT());
+}
+
+// the effects (tracers, flashes, particles) drawn into the scene's light, tested against its depth
+fn fx_begin() {
+  var k: int32 = R->hdr_i;
+  glBindFramebuffer(GL_FRAMEBUFFER(), R->fx_fbo[k]);
+  glFramebufferTexture2D(GL_FRAMEBUFFER(), GL_COLOR_ATTACHMENT0(), GL_TEXTURE_2D(), R->t_hdr[k].tex, 0);
+  glFramebufferTexture2D(GL_FRAMEBUFFER(), GL_DEPTH_ATTACHMENT(), GL_TEXTURE_2D(), R->gdepth, 0);
+  glDrawBuffersN(1);
+  glViewport(0, 0, R->w, R->h);
+  glEnable(GL_DEPTH_TEST());
+  glDepthFunc(GL_LEQUAL());
+  glDepthMask((uint8)0);
+}
+
+// THE LENS AND THE FILM, onto the screen:
+//   glow       the bloom chain: 13-tap down with a Karis average, tent up, added (Jimenez, CoD: AW) -- all of the
+//              light, a little of it (a lens's glow, not a threshold's)
+//   the game's own pass (HK->post)
+//   film       the exposure, Reinhard, the lens's corners, a grain (shaders/final.frag; the game's extension, HK->film)
+//   FXAA       its edges smoothed, onto the screen
+fn final_pass() {
+  var w: int32 = R->w;
+  var h: int32 = R->h;
+  var cur: int32 = R->hdr_i;
+  glDisable(GL_DEPTH_TEST());
+  glDepthMask((uint8)0);
+  glDisable(GL_BLEND());
+  var bw: int32 = w;
+  var bh: int32 = h;
+  var i: int32 = 0;
+  while (i < NBLOOM()) {
+    bw = (bw + 1) / 2; bh = (bh + 1) / 2;
+    if (bw < 1) { bw = 1; }
+    if (bh < 1) { bh = 1; }
+    tgt_make(&R->t_bloom[i], bw, bh, 1);
+    i = i + 1;
+  }
+  // ---- the glow: down the chain, then up it, each level added onto the one above
+  var p: uint32 = R->p_bdown;
+  glUseProgram(p);
+  glUniform1i(uloc(p, "uSrc"), 2);
+  glUniform1f(uloc(p, "uThreshold"), 0.0);
+  glUniform1f(uloc(p, "uKnee"), 0.0);
+  i = 0;
+  while (i < NBLOOM()) {
+    var src: Tgt* = &R->t_hdr[cur];
+    if (i > 0) { src = &R->t_bloom[i - 1]; }
+    fs_into(&R->t_bloom[i]);
+    gl_bind_tex(2, src->tex);
+    glUniform2f(uloc(p, "uTexel"), (float32)(1.0 / (float64)src->w), (float32)(1.0 / (float64)src->h));
+    var first: int32 = 0;
+    if (i == 0) { first = 1; }
+    glUniform1i(uloc(p, "uFirst"), first);
+    fs_draw();
+    i = i + 1;
+  }
+  p = R->p_bup;
+  glUseProgram(p);
+  glUniform1i(uloc(p, "uSrc"), 2);
+  glUniform1f(uloc(p, "uRadius"), 1.0);
+  glEnable(GL_BLEND());
+  glBlendFunc(GL_ONE(), GL_ONE());
+  i = NBLOOM() - 1;
+  while (i > 0) {
+    var sm: Tgt* = &R->t_bloom[i];
+    fs_into(&R->t_bloom[i - 1]);
+    gl_bind_tex(2, sm->tex);
+    glUniform2f(uloc(p, "uTexel"), (float32)(1.0 / (float64)sm->w), (float32)(1.0 / (float64)sm->h));
+    fs_draw();
+    i = i - 1;
+  }
+  glDisable(GL_BLEND());
+  gpu_end(GZ_BLOOM());
+  // ---- the game's own pass, if it has one
+  HK->post();
+  // ---- the lens and the film
+  tgt_make(&R->t_ldr, w, h, 1);
+  fs_into(&R->t_ldr);
+  p = R->p_final;
+  glUseProgram(p);
+  gl_bind_tex(2, R->t_hdr[cur].tex);
+  gl_bind_tex(3, R->t_bloom[0].tex);
+  glUniform1i(uloc(p, "uHdrT"), 2);
+  glUniform1i(uloc(p, "uBloomT"), 3);
+  glUniform2f(uloc(p, "uScreen"), (float32)w, (float32)h);
+  glUniform1f(uloc(p, "uExposure"), (float32)R->exposure);
+  glUniform1f(uloc(p, "uBloom"), (float32)R->bloom);
+  glUniform1f(uloc(p, "uTime"), (float32)R->time);
+  set_light(p);
+  HK->film(p);
+  fs_draw();
+  gpu_end(GZ_FINAL());
+  // ---- its edges smoothed, onto the screen
+  fs_into((Tgt*)0);
+  p = R->p_fxaa;
+  glUseProgram(p);
+  gl_bind_tex(2, R->t_ldr.tex);
+  glUniform1i(uloc(p, "uSrc"), 2);
+  glUniform2f(uloc(p, "uScreen"), (float32)w, (float32)h);
+  fs_draw();
+  gpu_end(GZ_AA());
+  glDepthMask((uint8)1);
+  glEnable(GL_DEPTH_TEST());
+  // (this frame's view kept: next frame's reflections find their points on its light)
+  var q: int32 = 0;
+  while (q < 16) { R->prev_vp[q] = R->vp[q]; q = q + 1; }
+  R->hdr_i = 1 - cur;
+}
+
+// the light the world shares, onto a program in use
+fn set_light(p: uint32) {
+  var s: Vec3 = R->sun;
+  glUniform3f(uloc(p, "uSunDir"), (float32)s.x, (float32)s.y, (float32)s.z);
+  // (a clear afternoon: the sun's light about four times the sky's on open ground, the shade a cool blue; the air
+  // clear near, hazed far)
+  glUniform3f(uloc(p, "uSunCol"), 3.3, 2.85, 2.25);
+  glUniform3f(uloc(p, "uSkyCol"), 0.30, 0.40, 0.60);
+  glUniform3f(uloc(p, "uGndCol"), 0.20, 0.165, 0.125);
+  glUniform3f(uloc(p, "uFogCol"), 0.72, 0.70, 0.66);
+  glUniform1f(uloc(p, "uFogDen"), 0.0011);
+  glUniform3f(uloc(p, "uCamPos"), (float32)R->cam.x, (float32)R->cam.y, (float32)R->cam.z);
+}
+
+// ---------------------------------------------------------------- the frame
+// the shadow map's cascade k (0 near, 1 far): an orthographic box from the sun round a point ahead of the eye (along
+// fwd, flattened), its half width CASC0 / CASC1, snapped to its texels so the shadows don't crawl as you move; into
+// its half of the map (the first clears it all)
+fn shadow_begin(eye: Vec3, fwd: Vec3, k: int32) {
+  var half: float64 = CASC0();
+  var ahead: float64 = 4.0;
+  if (k != 0) { half = CASC1(); ahead = 30.0; }
+  var fl: Vec3 = v3(fwd.x, 0.0, fwd.z);
+  if (vlen(fl) < 0.01) { fl = v3(0.0, 0.0, -1.0); }
+  var focus: Vec3 = vadd(eye, vmul(vunit(fl), ahead));
+  var sun_eye: Vec3 = vadd(focus, vmul(R->sun, 60.0));
+  // the light's frame: looking down -sun
+  var f: Vec3 = vneg(R->sun);
+  var up: Vec3 = v3(0.0, 1.0, 0.0);
+  var rt: Vec3 = vunit(vcross(f, up));
+  var u: Vec3 = vcross(rt, f);
+  var texel: float64 = half * 2.0 / (float64)SHADOW_N();
+  var cx: float64 = m_floor(vdot(focus, rt) / texel) * texel;
+  var cy: float64 = m_floor(vdot(focus, u) / texel) * texel;
+  var view: float32* = (float32*)malloc(64);
+  // rows: right, up, -forward
+  view[0] = (float32)rt.x; view[4] = (float32)rt.y; view[8] = (float32)rt.z;
+  view[1] = (float32)u.x; view[5] = (float32)u.y; view[9] = (float32)u.z;
+  view[2] = (float32)-f.x; view[6] = (float32)-f.y; view[10] = (float32)-f.z;
+  view[3] = 0.0; view[7] = 0.0; view[11] = 0.0;
+  view[12] = (float32)(-cx); view[13] = (float32)(-cy); view[14] = (float32)vdot(f, sun_eye); view[15] = 1.0;
+  var proj: float32* = (float32*)malloc(64);
+  m4_ortho(proj, -half, half, -half, half, 1.0, 160.0);
+  m4_mul(&R->light_vp[k * 16], proj, view);
+  free((uint8*)view);
+  free((uint8*)proj);
+  glBindFramebuffer(GL_FRAMEBUFFER(), R->shadow_fbo);
+  glEnable(GL_DEPTH_TEST());
+  glDepthMask((uint8)1);
+  if (k == 0) {
+    glViewport(0, 0, SHADOW_N() * 2, SHADOW_N());
+    glClear(GL_DEPTH_BUFFER_BIT());
+    gpu_start();
+  }
+  glViewport(k * SHADOW_N(), 0, SHADOW_N(), SHADOW_N());
+  glDisable(GL_CULL_FACE());
+  glEnable(GL_POLYGON_OFFSET_FILL());
+  glPolygonOffset(1.5, 2.0);
+  R->shadow_pass = 1;
+  R->casc = k;
+  glp->n_passes = glp->n_passes + 1;
+}
+
+// the camera: where it is, how it's turned (it looks down its -Z), its vertical FOV (degrees)
+fn main_begin(cam: Vec3, rot: Quat, fov_deg: float64, w: int32, h: int32) {
+  gpu_end(GZ_SHADOW());
+  glp->n_passes = glp->n_passes + 1;
+  glDisable(GL_POLYGON_OFFSET_FILL());
+  R->w = w; R->h = h;
+  gbuf_ensure(w, h);
+  glBindFramebuffer(GL_FRAMEBUFFER(), R->gfbo);
+  glDrawBuffersN(4);
+  glViewport(0, 0, w, h);
+  R->shadow_pass = 0;
+  R->cam = cam;
+  R->cam_rot = rot;
+  var view: float32* = (float32*)malloc(64);
+  var proj: float32* = (float32*)malloc(64);
+  m4_view(view, rot, cam);
+  var aspect: float64 = (float64)w / maxf((float64)h, 1.0);
+  m4_persp(proj, rad(fov_deg), aspect, 0.05, 900.0);
+  R->p11 = (float64)proj[5];
+  m4_mul(&R->vp[0], proj, view);
+  // the inverse, for the sky's rays: (P V)^-1 = V^-1 P^-1 -- V^-1 is the camera's frame, P^-1 by hand
+  var cf: float32* = (float32*)malloc(64);
+  m4_from_qt(cf, rot, cam);
+  var pinv: float32* = (float32*)malloc(64);
+  var i: int32 = 0;
+  while (i < 16) { pinv[i] = 0.0; i = i + 1; }
+  pinv[0] = 1.0 / proj[0];
+  pinv[5] = 1.0 / proj[5];
+  pinv[11] = 1.0 / proj[14];
+  pinv[14] = -1.0;
+  pinv[15] = proj[10] / proj[14];
+  m4_mul(&R->inv_vp[0], cf, pinv);
+  free((uint8*)view); free((uint8*)proj); free((uint8*)cf); free((uint8*)pinv);
+  glClearColor(0.0, 0.0, 0.0, 0.0);
+  glDepthMask((uint8)1);
+  glClear(GL_COLOR_BUFFER_BIT() | GL_DEPTH_BUFFER_BIT());
+  glEnable(GL_DEPTH_TEST());
+  glDepthFunc(GL_LEQUAL());
+  // the sky first, behind everything
+  glDepthMask((uint8)0);
+  glUseProgram(R->p_sky);
+  set_light(R->p_sky);
+  glUniformMatrix4fv(uloc(R->p_sky, "uInvVP"), 1, &R->inv_vp[0]);
+  glBindVertexArray(R->sky_vao);
+  glDrawArrays(GL_TRIANGLES(), 0, 3);
+  gl_count_draw(3);
+  glDepthMask((uint8)1);
+  gpu_end(GZ_SKY());
+}
+// the ground: drawn after everything else in the scene (its shader the dearest: what's hidden of it is never shaded)
+fn draw_ground() {
+  glUseProgram(R->p_ground);
+  set_light(R->p_ground);
+  glUniform1f(uloc(R->p_ground, "uObj"), 1.0);
+  glUniform1f(uloc(R->p_ground, "uClass"), 8.0);
+  glUniformMatrix4fv(uloc(R->p_ground, "uViewProj"), 1, &R->vp[0]);
+  glBindVertexArray(R->ground_vao);
+  glDrawArrays(GL_TRIANGLES(), 0, 6);
+  gl_count_draw(6);
+  gpu_end(GZ_SKY());
+}
+
+fn cur_vp() -> float32* {
+  if (R->shadow_pass != 0) { return &R->light_vp[R->casc * 16]; }
+  return &R->vp[0];
+}
+
+// a block: centre, half extents, its colour, its object id
+fn draw_box(c: Vec3, half: Vec3, r: float64, g: float64, b: float64, obj: int32) {
+  var m: float32* = (float32*)malloc(64);
+  m4_ident(m);
+  m[0] = (float32)(half.x * 2.0); m[5] = (float32)(half.y * 2.0); m[10] = (float32)(half.z * 2.0);
+  m[12] = (float32)c.x; m[13] = (float32)c.y; m[14] = (float32)c.z;
+  var p: uint32 = R->p_box;
+  if (R->shadow_pass != 0) { p = R->p_static_sh; }
+  glUseProgram(p);
+  if (R->shadow_pass == 0) {
+    set_light(p);
+    glUniform3f(uloc(p, "uTint"), (float32)r, (float32)g, (float32)b);
+    glUniform1f(uloc(p, "uObj"), (float32)obj);
+    glUniform1f(uloc(p, "uClass"), 3.0);
+  }
+  glUniformMatrix4fv(uloc(p, "uModel"), 1, m);
+  glUniformMatrix4fv(uloc(p, "uViewProj"), 1, cur_vp());
+  glBindVertexArray(R->cube_vao);
+  if (R->shadow_pass == 0) { glEnable(GL_CULL_FACE()); glCullFace(GL_BACK()); }
+  glDrawArrays(GL_TRIANGLES(), 0, 36);
+  glDisable(GL_CULL_FACE());
+  gl_count_draw(36);
+  free((uint8*)m);
+}
+
+// a skinned mesh: its palette (16 floats a joint, nb of them, the model's space), its frame (model -> world), the first
+// of its material set's textures (tex_base: a mesh may carry several liveries), a glow (hit flash), a material to leave
+// out (-1 none), its object id and class
+fn draw_skinned(M: SkinMesh*, palette: float32*, nb: int32, model: float32*, tex_base: int32, glow: float64, skip: int32,
+                obj: int32, cls: int32) {
+  var p: uint32 = R->p_skin;
+  if (R->shadow_pass != 0) { p = R->p_skin_sh; }
+  glUseProgram(p);
+  glUniformMatrix4fv(uloc(p, "uBones"), nb, palette);
+  glUniformMatrix4fv(uloc(p, "uModel"), 1, model);
+  glUniformMatrix4fv(uloc(p, "uViewProj"), 1, cur_vp());
+  HK->skin(p);
+  if (R->shadow_pass == 0) {
+    set_light(p);
+    glUniform3f(uloc(p, "uTint"), 1.0, 1.0, 1.0);
+    glUniform1f(uloc(p, "uGlow"), (float32)glow);
+    glUniform1i(uloc(p, "uTex"), 0);
+    glUniform1i(uloc(p, "uSurf"), 2);
+    glUniform1f(uloc(p, "uObj"), (float32)obj);
+    glUniform1f(uloc(p, "uClass"), (float32)cls);
+  }
+  glDisable(GL_CULL_FACE());
+  glBindVertexArray(M->vao);
+  var i: int32 = 0;
+  while (i < M->nsub) {
+    if (M->mat[i] == skip) { i = i + 1; continue; }
+    if (R->shadow_pass == 0) {
+      gl_bind_tex(0, M->tex[M->mat[i] + tex_base]);
+      gl_bind_tex(2, M->flat[M->mat[i] + tex_base]);
+    }
+    glDrawElements(GL_TRIANGLES(), M->count[i], GL_UNSIGNED_INT(), (int64)M->first[i] * 4);
+    gl_count_draw((int64)M->count[i]);
+    i = i + 1;
+  }
+}
+
+// a static textured mesh at `model`, its object id and class
+fn draw_static(G: StaticMesh*, model: float32*, obj: int32, cls: int32) {
+  if (G == 0) { return; }
+  var p: uint32 = R->p_tex;
+  if (R->shadow_pass != 0) { p = R->p_static_sh; }
+  glUseProgram(p);
+  glUniformMatrix4fv(uloc(p, "uModel"), 1, model);
+  glUniformMatrix4fv(uloc(p, "uViewProj"), 1, cur_vp());
+  if (R->shadow_pass == 0) {
+    set_light(p);
+    glUniform3f(uloc(p, "uTint"), 1.0, 1.0, 1.0);
+    glUniform1f(uloc(p, "uGlow"), 0.0);
+    glUniform1i(uloc(p, "uTex"), 0);
+    glUniform1i(uloc(p, "uSurf"), 2);
+    glUniform1f(uloc(p, "uObj"), (float32)obj);
+    glUniform1f(uloc(p, "uClass"), (float32)cls);
+    HK->stat(p);
+    gl_bind_tex(0, G->tex);
+    gl_bind_tex(2, G->flat);
+  }
+  glBindVertexArray(G->vao);
+  glDrawElements(GL_TRIANGLES(), G->count, GL_UNSIGNED_INT(), 0);
+  gl_count_draw((int64)G->count);
+}
+
+// ---------------------------------------------------------------- quads (HUD in pixels, FX in the world)
+fn qv(buf: float32*, n: int32, x: float64, y: float64, z: float64, u: float64, v: float64, r: float64, g: float64, b: float64, a: float64) {
+  var o: int32 = n * QV_FLOATS();
+  buf[o] = (float32)x; buf[o + 1] = (float32)y; buf[o + 2] = (float32)z;
+  buf[o + 3] = (float32)u; buf[o + 4] = (float32)v;
+  buf[o + 5] = (float32)r; buf[o + 6] = (float32)g; buf[o + 7] = (float32)b; buf[o + 8] = (float32)a;
+}
+
+// a screen rectangle; u0 < 0: solid colour, else font atlas texture coordinates
+fn hud_quad(x: float64, y: float64, w: float64, h: float64, u0: float64, v0: float64, u1: float64, v1: float64,
+            r: float64, g: float64, b: float64, a: float64) {
+  if (R->hud_n + 6 > QUAD_CAP() * 6) { return; }
+  var n: int32 = R->hud_n;
+  qv(R->hud, n, x, y, 0.0, u0, v0, r, g, b, a);
+  qv(R->hud, n + 1, x + w, y, 0.0, u1, v0, r, g, b, a);
+  qv(R->hud, n + 2, x + w, y + h, 0.0, u1, v1, r, g, b, a);
+  qv(R->hud, n + 3, x, y, 0.0, u0, v0, r, g, b, a);
+  qv(R->hud, n + 4, x + w, y + h, 0.0, u1, v1, r, g, b, a);
+  qv(R->hud, n + 5, x, y + h, 0.0, u0, v1, r, g, b, a);
+  R->hud_n = n + 6;
+}
+fn hud_rect(x: float64, y: float64, w: float64, h: float64, r: float64, g: float64, b: float64, a: float64) {
+  hud_quad(x, y, w, h, -1.0, 0.0, -1.0, 0.0, r, g, b, a);
+}
+// a rotated bar (the hit marker's strokes): centre, half length, half width, angle
+fn hud_bar(cx: float64, cy: float64, hl: float64, hw: float64, ang: float64, r: float64, g: float64, b: float64, a: float64) {
+  if (R->hud_n + 6 > QUAD_CAP() * 6) { return; }
+  var c: float64 = m_cos(ang);
+  var s: float64 = m_sin(ang);
+  var ax: float64 = c * hl; var ay: float64 = s * hl;
+  var bx: float64 = -s * hw; var by: float64 = c * hw;
+  var n: int32 = R->hud_n;
+  qv(R->hud, n, cx - ax - bx, cy - ay - by, 0.0, -1.0, 0.0, r, g, b, a);
+  qv(R->hud, n + 1, cx + ax - bx, cy + ay - by, 0.0, -1.0, 0.0, r, g, b, a);
+  qv(R->hud, n + 2, cx + ax + bx, cy + ay + by, 0.0, -1.0, 0.0, r, g, b, a);
+  qv(R->hud, n + 3, cx - ax - bx, cy - ay - by, 0.0, -1.0, 0.0, r, g, b, a);
+  qv(R->hud, n + 4, cx + ax + bx, cy + ay + by, 0.0, -1.0, 0.0, r, g, b, a);
+  qv(R->hud, n + 5, cx - ax + bx, cy - ay + by, 0.0, -1.0, 0.0, r, g, b, a);
+  R->hud_n = n + 6;
+}
+// text at (x, y) (top left), `size` px tall; align 0 left, 1 centre, 2 right. -> its width
+fn hud_text(s: cstring, x: float64, y: float64, size: float64, align: int32, r: float64, g: float64, b: float64, a: float64) -> float64 {
+  var F: Font* = R->font;
+  var n: int32 = 0;
+  while (s[n] != (uint8)0) { n = n + 1; }
+  var sc: float64 = size / (float64)F->ch;
+  var cw: float64 = (float64)F->cw * sc * 0.92;
+  var w: float64 = cw * (float64)n;
+  var x0: float64 = x;
+  if (align == 1) { x0 = x - w * 0.5; }
+  if (align == 2) { x0 = x - w; }
+  var i: int32 = 0;
+  while (i < n) {
+    var c: int32 = (int32)s[i] - 32;
+    if (c > 0 && c < 95) {
+      var gx: float64 = (float64)((c % F->cols) * F->cw);
+      var gy: float64 = (float64)((c / F->cols) * F->ch);
+      var u0: float64 = gx / (float64)F->aw; var v0: float64 = gy / (float64)F->ah;
+      var u1: float64 = (gx + (float64)F->cw) / (float64)F->aw; var v1: float64 = (gy + (float64)F->ch) / (float64)F->ah;
+      // (a soft shadow under it, then the glyph)
+      hud_quad(x0 + (float64)i * cw + 1.5, y + 1.5, (float64)F->cw * sc, size, u0, v0, u1, v1, 0.0, 0.0, 0.0, a * 0.55);
+      hud_quad(x0 + (float64)i * cw, y, (float64)F->cw * sc, size, u0, v0, u1, v1, r, g, b, a);
+    }
+    i = i + 1;
+  }
+  return w;
+}
+
+// a world quad facing the camera: a streak from a to b, `wd` wide (tracers), colour additive
+fn fx_streak(a: Vec3, b: Vec3, wd: float64, r: float64, g: float64, bl: float64, al: float64) {
+  if (R->fx_n + 6 > QUAD_CAP() * 6) { return; }
+  var d: Vec3 = vsub(b, a);
+  var mid: Vec3 = vlerp(a, b, 0.5);
+  var side: Vec3 = vunit(vcross(d, vsub(R->cam, mid)));
+  side = vmul(side, wd * 0.5);
+  var n: int32 = R->fx_n;
+  var p0: Vec3 = vsub(a, side); var p1: Vec3 = vadd(a, side); var p2: Vec3 = vadd(b, side); var p3: Vec3 = vsub(b, side);
+  // (u runs -1..1 along: the streak tapers at both ends)
+  qv(R->fx, n, p0.x, p0.y, p0.z, -0.9, -1.0, r, g, bl, al);
+  qv(R->fx, n + 1, p1.x, p1.y, p1.z, -0.9, 1.0, r, g, bl, al);
+  qv(R->fx, n + 2, p2.x, p2.y, p2.z, 0.0, 1.0, r, g, bl, al);
+  qv(R->fx, n + 3, p0.x, p0.y, p0.z, -0.9, -1.0, r, g, bl, al);
+  qv(R->fx, n + 4, p2.x, p2.y, p2.z, 0.0, 1.0, r, g, bl, al);
+  qv(R->fx, n + 5, p3.x, p3.y, p3.z, 0.0, -1.0, r, g, bl, al);
+  R->fx_n = n + 6;
+}
+// a camera-facing blob at p, radius rr
+fn fx_blob(p: Vec3, rr: float64, r: float64, g: float64, b: float64, a: float64) {
+  if (R->fx_n + 6 > QUAD_CAP() * 6) { return; }
+  var right: Vec3 = vmul(qrot(R->cam_rot, v3(1.0, 0.0, 0.0)), rr);
+  var up: Vec3 = vmul(qrot(R->cam_rot, v3(0.0, 1.0, 0.0)), rr);
+  var n: int32 = R->fx_n;
+  var c0: Vec3 = vsub(vsub(p, right), up); var c1: Vec3 = vsub(vadd(p, right), up);
+  var c2: Vec3 = vadd(vadd(p, right), up); var c3: Vec3 = vadd(vsub(p, right), up);
+  qv(R->fx, n, c0.x, c0.y, c0.z, -1.0, -1.0, r, g, b, a);
+  qv(R->fx, n + 1, c1.x, c1.y, c1.z, 1.0, -1.0, r, g, b, a);
+  qv(R->fx, n + 2, c2.x, c2.y, c2.z, 1.0, 1.0, r, g, b, a);
+  qv(R->fx, n + 3, c0.x, c0.y, c0.z, -1.0, -1.0, r, g, b, a);
+  qv(R->fx, n + 4, c2.x, c2.y, c2.z, 1.0, 1.0, r, g, b, a);
+  qv(R->fx, n + 5, c3.x, c3.y, c3.z, -1.0, 1.0, r, g, b, a);
+  R->fx_n = n + 6;
+}
+
+fn fx_flush() {
+  if (R->fx_n > 0) {
+    glEnable(GL_BLEND());
+    glBlendFunc(GL_ONE(), GL_ONE());
+    glDepthMask((uint8)0);
+    glUseProgram(R->p_fx);
+    glUniformMatrix4fv(uloc(R->p_fx, "uViewProj"), 1, &R->vp[0]);
+    glBindVertexArray(R->fx_vao);
+    glBindBuffer(GL_ARRAY_BUFFER(), R->fx_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER(), 0, (int64)R->fx_n * (int64)QV_FLOATS() * 4, (uint8*)R->fx);
+    glDrawArrays(GL_TRIANGLES(), 0, R->fx_n);
+    gl_count_draw((int64)R->fx_n);
+    glDepthMask((uint8)1);
+    glDisable(GL_BLEND());
+  }
+  R->fx_n = 0;
+}
+
+fn hud_flush() {
+  if (R->hud_n > 0) {
+    glDisable(GL_DEPTH_TEST());
+    glEnable(GL_BLEND());
+    glBlendFunc(GL_SRC_ALPHA(), GL_ONE_MINUS_SRC_ALPHA());
+    glUseProgram(R->p_hud);
+    glUniform2f(uloc(R->p_hud, "uScreen"), (float32)R->w, (float32)R->h);
+    gl_bind_tex(0, R->font->tex);
+    glUniform1i(uloc(R->p_hud, "uFont"), 0);
+    glBindVertexArray(R->hud_vao);
+    glBindBuffer(GL_ARRAY_BUFFER(), R->hud_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER(), 0, (int64)R->hud_n * (int64)QV_FLOATS() * 4, (uint8*)R->hud);
+    glDrawArrays(GL_TRIANGLES(), 0, R->hud_n);
+    gl_count_draw((int64)R->hud_n);
+    glDisable(GL_BLEND());
+    glEnable(GL_DEPTH_TEST());
+  }
+  R->hud_n = 0;
+}
+
+// the world point -> the screen (pixels); z < 0 when it's behind the camera
+fn world_to_screen(p: Vec3) -> Vec3 {
+  var m: float32* = &R->vp[0];
+  var x: float64 = m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12];
+  var y: float64 = m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13];
+  var w: float64 = m[3] * p.x + m[7] * p.y + m[11] * p.z + m[15];
+  if (w < 0.001) { return v3(0.0, 0.0, -1.0); }
+  return v3((x / w * 0.5 + 0.5) * (float64)R->w, (0.5 - y / w * 0.5) * (float64)R->h, w);
+}

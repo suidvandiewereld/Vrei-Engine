@@ -1,0 +1,40 @@
+// smoke test: the engine with no game -- every renderer program built with the default extensions, a few frames of a
+// block on the ground under the sun (shadows, G-buffer, light, film); quits after 60 frames. 0: it all worked
+import "std/io";
+import "std/mem";
+import "std/math";
+import "std/ui";
+import "engine/math";
+import "engine/win";
+import "engine/gl";
+import "engine/render";
+
+fn main() -> int32 {
+  if (win_open("engine only".chars, 640, 360) == 0) { return 1; }
+  if (gl_create(IN->hwnd) == 0) { return 2; }
+  if (render_init((Font*)0, IN->w, IN->h) == 0) { println("renderer failed"); return 3; }
+  var cam: Vec3 = v3(0.0, 1.7, 6.0);
+  var rot: Quat = qaxis(v3(1.0, 0.0, 0.0), -0.15);
+  var f: int32 = 0;
+  while (f < 60 && win_pump() != 0) {
+    frame_begin();
+    var k: int32 = 0;
+    while (k < 2) {
+      shadow_begin(cam, v3(0.0, 0.0, -1.0), k);
+      draw_box(v3(0.0, 0.75, 0.0), v3(1.0, 0.75, 1.0), 0.6, 0.6, 0.6, 2);
+      k = k + 1;
+    }
+    main_begin(cam, rot, 70.0, IN->w, IN->h);
+    draw_box(v3(0.0, 0.75, 0.0), v3(1.0, 0.75, 1.0), 0.6, 0.6, 0.6, 2);
+    draw_ground();
+    light_pass();
+    fx_begin();
+    fx_flush();
+    final_pass();
+    frame_end();
+    gl_swap();
+    f = f + 1;
+  }
+  println("engine only: {f} frames");
+  return 0;
+}

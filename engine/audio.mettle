@@ -1,0 +1,344 @@
+import "std/io";
+import "std/mem";
+import "math";
+import "assets";
+
+extern fn Wo_Open(out: int64*, dev: uint32, fmt: uint8*, cb: int64, inst: int64, flags: uint32) -> uint32 = "waveOutOpen";
+extern fn Wo_Prepare(h: int64, hdr: uint8*, size: uint32) -> uint32 = "waveOutPrepareHeader";
+extern fn Wo_Write(h: int64, hdr: uint8*, size: uint32) -> uint32 = "waveOutWrite";
+extern fn Wo_Reset(h: int64) -> uint32 = "waveOutReset";
+extern fn Au_CreateThread(attrs: int64, stack: int64, start: int64, param: int64, flags: uint32, tid: int64) -> int64 = "CreateThread";
+extern fn Au_Sleep(ms: uint32) = "Sleep";
+extern fn Au_SetThreadPriority(h: int64, pri: int32) -> int32 = "SetThreadPriority";
+
+fn AU_BLOCK() -> int32 { return 512; }
+fn AU_NBUF() -> int32 { return 6; }
+fn AU_VOICES() -> int32 { return 48; }
+fn AU_RING() -> int32 { return 256; }
+fn AU_LOOPS() -> int32 { return 4; }
+
+struct Snd { name: uint8*; n: int32; loop: int32; data: int16*; }
+
+struct Voice {
+  active: int32;
+  snd: int32;
+  pos: float64;                // in the sound's samples
+  end: float64;
+  rate: float64;
+  vl: float64; vr: float64;
+  delay: int32;                // output frames before it starts
+  ctl: int32;                  // a loop channel (-1: a one-shot)
+  lv: float64; lr: float64;    // a loop's eased level and speed
+  age: int32;                  // frames it's played (the fade in)
+}
+
+struct AuCmd {
+  snd: int32;
+  vl: float64; vr: float64;
+  rate: float64;
+  t0: float64; t1: float64;    // the part of it (seconds; t1 < 0: to its end)
+  delay: float64;              // seconds
+  ctl: int32;
+}
+
+struct Audio {
+  ok: int32;
+  hwo: int64;
+  nsnd: int32;
+  snds: Snd*;
+  voices: Voice[48];
+  ring: AuCmd[256];
+  head: int32;                 // written by the game thread
+  tail: int32;                 // the mixer's
+  ctl_vol: float64[4];         // loop channels: what the game wants
+  ctl_rate: float64[4];
+  hdr: uint8*;                 // AU_NBUF WAVEHDRs, 48 bytes each
+  pcm: int16*;                 // AU_NBUF blocks, stereo
+  mix: float64*;
+  master: float64;
+  lim: float64;                // the limiter's gain
+  lim_min: float64;            // its lowest since the overlay last read it
+  blocks: int64;               // blocks mixed
+  underruns: int64;            // times every queued block had played out (the device ran dry: a crackle)
+  nvoice: int32;               // voices sounding
+  // the listener (the camera), for the sounds placed in the world
+  lp: Vec3; lright: Vec3;
+}
+
+var AU: Audio* = 0;
+
+// (the ring's head through a call: the mixer thread must see the store, not a value held in a register)
+@noinline fn au_head() -> int32 { return AU->head; }
+@noinline fn au_publish(h: int32) { AU->head = h; }
+
+fn sfx_find(name: cstring) -> int32 {
+  if (AU == 0) { return -1; }
+  var i: int32 = 0;
+  while (i < AU->nsnd) {
+    if (name_is(AU->snds[i].name, name) != 0) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// one of the takes whose names start with prefix ("fs_walk_" -> fs_walk_0..13), at random (Audio.pick)
+fn sfx_pick(prefix: cstring) -> int32 {
+  if (AU == 0) { return -1; }
+  var n: int32 = 0;
+  var i: int32 = 0;
+  while (i < AU->nsnd) {
+    if (name_starts(AU->snds[i].name, prefix) != 0) { n = n + 1; }
+    i = i + 1;
+  }
+  if (n == 0) { return -1; }
+  var k: int32 = (int32)(rnd() * (float64)n);
+  if (k >= n) { k = n - 1; }
+  i = 0;
+  while (i < AU->nsnd) {
+    if (name_starts(AU->snds[i].name, prefix) != 0) {
+      if (k == 0) { return i; }
+      k = k - 1;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn au_push(snd: int32, vl: float64, vr: float64, rate: float64, t0: float64, t1: float64, delay: float64, ctl: int32) {
+  if (AU == 0 || AU->ok == 0 || snd < 0) { return; }
+  var h: int32 = AU->head;
+  if (h - AU->tail >= AU_RING() - 1) { return; }             // (full: dropped)
+  var C: AuCmd* = &AU->ring[h % AU_RING()];
+  C->snd = snd; C->vl = vl; C->vr = vr; C->rate = rate; C->t0 = t0; C->t1 = t1; C->delay = delay; C->ctl = ctl;
+  au_publish(h + 1);
+}
+
+// in your head (2D): name's sound, how loud, how fast (the Roblox PlaybackSpeed: pitch with it), a little apart
+fn sfx(snd: int32, vol: float64, rate: float64) { au_push(snd, vol, vol, rate * rnd_range(0.95, 1.05), 0.0, -1.0, 0.0, -1); }
+fn sfx_later(snd: int32, vol: float64, rate: float64, delay: float64) { au_push(snd, vol, vol, rate * rnd_range(0.95, 1.05), 0.0, -1.0, delay, -1); }
+// a part of a sound (t0..t1 s of it), after delay s
+fn sfx_part(snd: int32, vol: float64, rate: float64, t0: float64, t1: float64, delay: float64) { au_push(snd, vol, vol, rate, t0, t1, delay, -1); }
+
+// at a place in the world: quieter with distance (Roblox's InverseTapered roll-off: full within 5 m, gone by
+// 200), turned toward its side
+fn sfx_at(snd: int32, p: Vec3, vol: float64, rate: float64, delay: float64) {
+  if (AU == 0) { return; }
+  var d: Vec3 = vsub(p, AU->lp);
+  var dist: float64 = vlen(d);
+  var g: float64 = 5.0 / maxf(dist, 5.0);
+  if (dist > 150.0) { g = g * maxf(0.0, 1.0 - (dist - 150.0) / 50.0); }
+  if (g < 0.002) { return; }
+  var pan: float64 = 0.0;
+  if (dist > 0.3) { pan = clampf(vdot(vmul(d, 1.0 / dist), AU->lright), -1.0, 1.0); }
+  var vl: float64 = vol * g * m_sqrt(1.0 - 0.6 * pan);
+  var vr: float64 = vol * g * m_sqrt(1.0 + 0.6 * pan);
+  au_push(snd, vl, vr, rate * rnd_range(0.95, 1.05), 0.0, -1.0, delay, -1);
+}
+
+// a loop channel: started once, then its level and speed set every frame (eased by the mixer)
+fn sfx_loop(ctl: int32, snd: int32) { AU->ctl_vol[ctl] = 0.0; AU->ctl_rate[ctl] = 1.0; au_push(snd, 1.0, 1.0, 1.0, 0.0, -1.0, 0.0, ctl); }
+fn sfx_loop_set(ctl: int32, vol: float64, rate: float64) {
+  if (AU == 0) { return; }
+  AU->ctl_vol[ctl] = vol;
+  AU->ctl_rate[ctl] = rate;
+}
+
+fn sfx_listener(p: Vec3, right: Vec3) {
+  if (AU == 0) { return; }
+  AU->lp = p;
+  AU->lright = right;
+}
+
+// ---------------------------------------------------------------- the mixer thread
+fn au_start_voice(C: AuCmd*) {
+  var best: int32 = -1;
+  var i: int32 = 0;
+  while (i < AU_VOICES()) {
+    if (AU->voices[i].active == 0) { best = i; break; }
+    i = i + 1;
+  }
+  if (best < 0) {
+    // (all busy: the quietest one-shot gives way)
+    var q: float64 = 1000000.0;
+    i = 0;
+    while (i < AU_VOICES()) {
+      var V0: Voice* = &AU->voices[i];
+      if (V0->ctl < 0 && V0->vl + V0->vr < q) { q = V0->vl + V0->vr; best = i; }
+      i = i + 1;
+    }
+    if (best < 0) { return; }
+  }
+  var V: Voice* = &AU->voices[best];
+  var S: Snd* = &AU->snds[C->snd];
+  V->snd = C->snd;
+  V->pos = C->t0 * 48000.0;
+  V->end = (float64)S->n;
+  if (C->t1 > 0.0) { V->end = minf(C->t1 * 48000.0, (float64)S->n); }
+  V->rate = C->rate;
+  V->vl = C->vl; V->vr = C->vr;
+  V->delay = (int32)(C->delay * 48000.0);
+  V->ctl = C->ctl;
+  V->lv = 0.0; V->lr = 1.0;
+  V->age = 0;
+  V->active = 1;
+}
+
+fn au_mix_block(out: int16*) {
+  var nb: int32 = AU_BLOCK();
+  var m: float64* = AU->mix;
+  var i: int32 = 0;
+  while (i < nb * 2) { m[i] = 0.0; i = i + 1; }
+  var v: int32 = 0;
+  var nv: int32 = 0;
+  while (v < AU_VOICES()) {
+    var V: Voice* = &AU->voices[v];
+    if (V->active != 0) {
+      nv = nv + 1;
+      var S: Snd* = &AU->snds[V->snd];
+      var vl: float64 = V->vl;
+      var vr: float64 = V->vr;
+      var rate: float64 = V->rate;
+      if (V->ctl >= 0) {
+        // (a loop: eased toward what the game wants, over ~60 ms)
+        V->lv = V->lv + (AU->ctl_vol[V->ctl] - V->lv) * 0.08;
+        V->lr = V->lr + (AU->ctl_rate[V->ctl] - V->lr) * 0.08;
+        vl = V->lv; vr = V->lv; rate = V->lr;
+      }
+      var f: int32 = 0;
+      if (V->delay > 0) {
+        f = V->delay;
+        if (f > nb) { f = nb; }
+        V->delay = V->delay - f;
+      }
+      while (f < nb) {
+        var p: float64 = V->pos;
+        if (p >= V->end - 1.0) {
+          if (V->ctl >= 0) { V->pos = 0.0; p = 0.0; }
+          else { V->active = 0; break; }
+        }
+        var ip: int32 = (int32)p;
+        var fr: float64 = p - (float64)ip;
+        var s: float64 = ((float64)S->data[ip] * (1.0 - fr) + (float64)S->data[ip + 1] * fr) * (1.0 / 32768.0);
+        if (V->age < 96) { s = s * (float64)V->age / 96.0; }
+        if (V->ctl < 0) {
+          var left: float64 = (V->end - p) / rate;
+          if (left < 96.0) { s = s * left / 96.0; }
+        }
+        V->age = V->age + 1;
+        m[f * 2] = m[f * 2] + s * vl;
+        m[f * 2 + 1] = m[f * 2 + 1] + s * vr;
+        V->pos = p + rate;
+        f = f + 1;
+      }
+    }
+    v = v + 1;
+  }
+  AU->nvoice = nv;
+  // the master; a peak limiter (instant attack, ~150 ms release) holding it under 0.9; a soft knee for what's left
+  var rel: float64 = 1.0 / (0.15 * 48000.0);
+  i = 0;
+  while (i < nb) {
+    var l: float64 = m[i * 2] * AU->master;
+    var r: float64 = m[i * 2 + 1] * AU->master;
+    var pk: float64 = maxf(absf(l), absf(r));
+    var want: float64 = 1.0;
+    if (pk * AU->lim > 0.9) { want = 0.9 / pk; }
+    if (want < AU->lim) { AU->lim = want; } else { AU->lim = AU->lim + (1.0 - AU->lim) * rel; }
+    if (AU->lim < AU->lim_min) { AU->lim_min = AU->lim; }
+    l = clampf(l * AU->lim, -1.0, 1.0);
+    r = clampf(r * AU->lim, -1.0, 1.0);
+    l = l * (1.5 - 0.5 * l * l);
+    r = r * (1.5 - 0.5 * r * r);
+    out[i * 2] = (int16)(l * 32000.0);
+    out[i * 2 + 1] = (int16)(r * 32000.0);
+    i = i + 1;
+  }
+}
+
+fn au_thread(param: int64) -> uint32 {
+  while (AU->ok != 0) {
+    // the commands the game has pushed
+    var h: int32 = au_head();
+    while (AU->tail < h) {
+      au_start_voice(&AU->ring[AU->tail % AU_RING()]);
+      AU->tail = AU->tail + 1;
+    }
+    // every block the device has finished with: mixed again and queued (all of them at once: it ran dry)
+    var ndone: int32 = 0;
+    var b0: int32 = 0;
+    while (b0 < AU_NBUF()) {
+      if ((*(uint32*)(AU->hdr + b0 * 48 + 24) & (uint32)1) != (uint32)0) { ndone = ndone + 1; }
+      b0 = b0 + 1;
+    }
+    if (ndone == AU_NBUF() && AU->blocks > (int64)AU_NBUF()) { AU->underruns = AU->underruns + 1; }
+    var b: int32 = 0;
+    while (b < AU_NBUF()) {
+      var hd: uint8* = AU->hdr + b * 48;
+      var flags: uint32 = *(uint32*)(hd + 24);
+      if ((flags & (uint32)1) != (uint32)0) {
+        au_mix_block(AU->pcm + b * AU_BLOCK() * 2);
+        AU->blocks = AU->blocks + 1;
+        *(uint32*)(hd + 24) = flags & (uint32)0xFFFFFFFE;
+        Wo_Write(AU->hwo, hd, (uint32)48);
+      }
+      b = b + 1;
+    }
+    Au_Sleep((uint32)1);
+  }
+  return (uint32)0;
+}
+
+// ---------------------------------------------------------------- the bank, the device
+fn audio_init(bank: cstring) -> int32 {
+  AU = new Audio;
+  AU->master = 0.8;
+  AU->lim = 1.0;
+  AU->lim_min = 1.0;
+  AU->lright = v3(1.0, 0.0, 0.0);
+  var size: int64 = 0;
+  var p: uint8* = read_file(asset_path(bank), &size);
+  if (p == 0 || magic_ok(p, "RFSX".chars) == 0) { print("no sound bank "); println_cstr(bank); return 0; }
+  AU->nsnd = rd_i32(p, 4);
+  AU->snds = (Snd*)malloc((int64)AU->nsnd * (int64)sizeof(Snd));
+  var o: int64 = 12;
+  var i: int32 = 0;
+  while (i < AU->nsnd) {
+    var S: Snd* = &AU->snds[i];
+    S->name = p + o;
+    S->n = rd_i32(p, o + 24);
+    S->loop = rd_i32(p, o + 28);
+    S->data = (int16*)(p + o + 32);
+    o = o + 32 + (int64)S->n * 2;
+    if (S->n % 2 != 0) { o = o + 2; }
+    i = i + 1;
+  }
+  // 48 kHz, stereo, 16-bit PCM
+  var wf: uint8* = (uint8*)malloc(20);
+  memset(wf, 0, 20);
+  *(uint16*)wf = (uint16)1;
+  *(uint16*)(wf + 2) = (uint16)2;
+  *(uint32*)(wf + 4) = (uint32)48000;
+  *(uint32*)(wf + 8) = (uint32)(48000 * 4);
+  *(uint16*)(wf + 12) = (uint16)4;
+  *(uint16*)(wf + 14) = (uint16)16;
+  if (Wo_Open(&AU->hwo, (uint32)0xFFFFFFFF, wf, 0, 0, (uint32)0) != (uint32)0) { println("no audio device"); return 0; }
+  AU->hdr = (uint8*)malloc((int64)AU_NBUF() * 48);
+  memset(AU->hdr, 0, (int64)AU_NBUF() * 48);
+  AU->pcm = (int16*)malloc((int64)AU_NBUF() * (int64)AU_BLOCK() * 4);
+  memset((uint8*)AU->pcm, 0, (int64)AU_NBUF() * (int64)AU_BLOCK() * 4);
+  AU->mix = (float64*)malloc((int64)AU_BLOCK() * 16);
+  var b: int32 = 0;
+  while (b < AU_NBUF()) {
+    var hd: uint8* = AU->hdr + b * 48;
+    *(int64*)hd = (int64)(AU->pcm + b * AU_BLOCK() * 2);
+    *(uint32*)(hd + 8) = (uint32)(AU_BLOCK() * 4);
+    Wo_Prepare(AU->hwo, hd, (uint32)48);
+    Wo_Write(AU->hwo, hd, (uint32)48);
+    b = b + 1;
+  }
+  AU->ok = 1;
+  var th: int64 = Au_CreateThread(0, 0, (int64)&au_thread, 0, (uint32)0, 0);
+  Au_SetThreadPriority(th, 15);                                // (THREAD_PRIORITY_TIME_CRITICAL: it must not starve)
+  println("audio: {AU->nsnd} sounds, waveOut 48 kHz");
+  return 1;
+}

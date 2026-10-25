@@ -1,0 +1,96 @@
+import "std/io";
+import "std/mem";
+import "math";
+import "assets";
+
+var CLIPS: ClipSet* = 0;
+var SKEL: Skel* = 0;
+
+fn anim_bind(S: Skel*, CS: ClipSet*) { SKEL = S; CLIPS = CS; }
+
+var ANIM_FPS: float64 = 0.0;
+
+fn NJ() -> int32 { return SKEL->nj; }
+
+fn joint_find(name: cstring) -> int32 {
+  var i: int32 = 0;
+  while (i < SKEL->nj) {
+    if (name_is(SKEL->names + i * 16, name) != 0) { return i; }
+    i = i + 1;
+  }
+  print("missing joint "); println_cstr(name);
+  return 0;
+}
+
+fn anim_q(t: float64) -> float64 {
+  if (ANIM_FPS <= 0.0) { return t; }
+  return m_floor(t * ANIM_FPS + 0.0001) / ANIM_FPS;
+}
+fn clip_t(ci: int32, j: int32, t0: float64) -> Vec3 {
+  var c: Clip* = &CLIPS->clips[ci];
+  var t: float64 = anim_q(t0);
+  var f: float64 = t * c->fps;
+  var i: int32 = (int32)m_floor(f);
+  var u: float64 = f - (float64)i;
+  if (i < 0) { i = 0; u = 0.0; }
+  if (i >= c->nf - 1) { i = c->nf - 1; u = 0.0; }
+  var i2: int32 = i + 1;
+  if (i2 > c->nf - 1) { i2 = c->nf - 1; }
+  var nj: int64 = (int64)CLIPS->nj;
+  var a: float32* = c->data + ((int64)i * nj + (int64)j) * 7;
+  var b: float32* = c->data + ((int64)i2 * nj + (int64)j) * 7;
+  return v3((float64)a[0] + ((float64)b[0] - (float64)a[0]) * u, (float64)a[1] + ((float64)b[1] - (float64)a[1]) * u,
+            (float64)a[2] + ((float64)b[2] - (float64)a[2]) * u);
+}
+fn clip_r(ci: int32, j: int32, t0: float64) -> Quat {
+  var c: Clip* = &CLIPS->clips[ci];
+  var t: float64 = anim_q(t0);
+  var f: float64 = t * c->fps;
+  var i: int32 = (int32)m_floor(f);
+  var u: float64 = f - (float64)i;
+  if (i < 0) { i = 0; u = 0.0; }
+  if (i >= c->nf - 1) { i = c->nf - 1; u = 0.0; }
+  var i2: int32 = i + 1;
+  if (i2 > c->nf - 1) { i2 = c->nf - 1; }
+  var nj: int64 = (int64)CLIPS->nj;
+  var a: float32* = c->data + ((int64)i * nj + (int64)j) * 7 + 3;
+  var b: float32* = c->data + ((int64)i2 * nj + (int64)j) * 7 + 3;
+  return qlerp(q4((float64)a[0], (float64)a[1], (float64)a[2], (float64)a[3]),
+               q4((float64)b[0], (float64)b[1], (float64)b[2], (float64)b[3]), u);
+}
+fn clip_dur(ci: int32) -> float64 { return CLIPS->clips[ci].dur; }
+fn clip_loops(ci: int32) -> int32 { return CLIPS->clips[ci].loop; }
+fn rest_t(j: int32) -> Vec3 {
+  var r: float32* = SKEL->rest + j * 7;
+  return v3((float64)r[0], (float64)r[1], (float64)r[2]);
+}
+fn rest_r(j: int32) -> Quat {
+  var r: float32* = SKEL->rest + j * 7;
+  return q4((float64)r[3], (float64)r[4], (float64)r[5], (float64)r[6]);
+}
+
+fn skel_world(lt: Vec3*, lr: Quat*, wt: Vec3*, wr: Quat*) {
+  var i: int32 = 0;
+  while (i < SKEL->nj) {
+    var p: int32 = SKEL->parent[i];
+    if (p < 0) {
+      wt[i] = lt[i];
+      wr[i] = lr[i];
+    } else {
+      wt[i] = vadd(wt[p], qrot(wr[p], lt[i]));
+      wr[i] = qnorm(qmul(wr[p], lr[i]));
+    }
+    i = i + 1;
+  }
+}
+
+fn skel_palette(wt: Vec3*, wr: Quat*, out: float32*) {
+  var m: float32* = (float32*)malloc(64);
+  var i: int32 = 0;
+  while (i < SKEL->nj) {
+    m4_from_qt(m, wr[i], wt[i]);
+    m4_mul(out + i * 16, m, SKEL->ibm + i * 16);
+    i = i + 1;
+  }
+  free((uint8*)m);
+}

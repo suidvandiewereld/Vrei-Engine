@@ -1,0 +1,146 @@
+// The window and the input: a Win32 window (std/ui), the keys and buttons held, the mouse's movement each frame
+// (the cursor hidden and put back at the window's centre, as WarriorsOfServitude does), the wheel, focus.
+import "std/ui";
+import "std/mem";
+
+extern fn Win_SetCursorPos(x: int32, y: int32) -> int32 = "SetCursorPos";
+extern fn Win_GetCursorPos(p: UiPoint*) -> int32 = "GetCursorPos";
+extern fn Win_ClientToScreen(hwnd: int64, p: UiPoint*) -> int32 = "ClientToScreen";
+extern fn Win_ShowCursor(show: int32) -> int32 = "ShowCursor";
+extern fn Win_GetForegroundWindow() -> int64 = "GetForegroundWindow";
+extern fn Win_GetClientRect(hwnd: int64, r: int32*) -> int32 = "GetClientRect";
+extern fn Win_SetWindowTextA(hwnd: int64, s: cstring) -> int32 = "SetWindowTextA";
+extern fn Win_timeBeginPeriod(ms: uint32) -> uint32 = "timeBeginPeriod";
+extern fn Win_QueryPerformanceCounter(out: int64*) -> int32 = "QueryPerformanceCounter";
+extern fn Win_QueryPerformanceFrequency(out: int64*) -> int32 = "QueryPerformanceFrequency";
+extern fn Win_Sleep(ms: uint32) = "Sleep";
+
+struct Input {
+  hwnd: int64;
+  w: int32; h: int32;
+  keys: uint8[256];            // held
+  hit: uint8[256];             // went down this frame
+  lmb: int32; rmb: int32;
+  wheel: int32;                // notches this frame
+  mdx: float64; mdy: float64;  // pixels moved this frame
+  focus: int32;
+  locked: int32;               // the cursor's held at the centre (hidden)
+  cursor_hidden: int32;
+  quit: int32;
+  skip: int32;                 // frames to ignore the mouse after a lock (no jump)
+  nowarp: int32;               // leave the real cursor alone (the scripted demo)
+  qpf: int64;
+  t0: int64;
+}
+
+var IN: Input* = 0;
+
+fn win_proc(hwnd: int64, msg: uint32, wparam: int64, lparam: int64) -> int64 {
+  if (IN == 0) { return ui_def_window_proc(hwnd, msg, wparam, lparam); }
+  if (msg == UI_WM_ERASEBKGND()) { return 1; }
+  if (msg == UI_WM_SIZE()) {
+    IN->w = ui_size_width(lparam);
+    IN->h = ui_size_height(lparam);
+    return 0;
+  }
+  if (msg == UI_WM_KEYDOWN() || msg == (uint32)0x0104) {      // (WM_SYSKEYDOWN: Alt and F10 come that way)
+    if (wparam >= 0 && wparam < 256) {
+      var k: int32 = (int32)wparam;
+      if (IN->keys[k] == (uint8)0) { IN->hit[k] = (uint8)1; }
+      IN->keys[k] = (uint8)1;
+    }
+    return 0;
+  }
+  if (msg == UI_WM_KEYUP() || msg == (uint32)0x0105) {
+    if (wparam >= 0 && wparam < 256) { IN->keys[(int32)wparam] = (uint8)0; }
+    return 0;
+  }
+  if (msg == UI_WM_LBUTTONDOWN()) { IN->lmb = 1; IN->hit[1] = (uint8)1; if (IN->locked == 0 && IN->nowarp == 0) { input_lock(1); } return 0; }
+  if (msg == UI_WM_LBUTTONUP()) { IN->lmb = 0; return 0; }
+  if (msg == UI_WM_RBUTTONDOWN()) { IN->rmb = 1; return 0; }
+  if (msg == UI_WM_RBUTTONUP()) { IN->rmb = 0; return 0; }
+  if (msg == UI_WM_MOUSEWHEEL()) {
+    var hw: int32 = (int32)((wparam >> 16) & (int64)0xFFFF);
+    if (hw > 32767) { hw = hw - 65536; }
+    if (hw > 0) { IN->wheel = IN->wheel + 1; } else { IN->wheel = IN->wheel - 1; }
+    return 0;
+  }
+  if (msg == UI_WM_SETFOCUS()) { IN->focus = 1; IN->skip = 2; return 0; }
+  if (msg == UI_WM_KILLFOCUS()) {
+    IN->focus = 0;
+    var i: int32 = 0;
+    while (i < 256) { IN->keys[i] = (uint8)0; i = i + 1; }
+    IN->lmb = 0; IN->rmb = 0;
+    input_lock(0);
+    return 0;
+  }
+  if (msg == UI_WM_DESTROY()) { IN->quit = 1; ui_quit(0); return 0; }
+  return ui_def_window_proc(hwnd, msg, wparam, lparam);
+}
+
+fn input_lock(on: int32) {
+  IN->locked = on;
+  if (on != 0 && IN->cursor_hidden == 0) { Win_ShowCursor(0); IN->cursor_hidden = 1; IN->skip = 2; }
+  if (on == 0 && IN->cursor_hidden != 0) { Win_ShowCursor(1); IN->cursor_hidden = 0; }
+}
+
+fn win_open(title: cstring, w: int32, h: int32) -> int32 {
+  IN = new Input;
+  IN->w = w; IN->h = h;
+  IN->focus = 1;
+  Win_QueryPerformanceFrequency(&IN->qpf);
+  Win_QueryPerformanceCounter(&IN->t0);
+  Win_timeBeginPeriod((uint32)1);
+  IN->hwnd = ui_window_create_centered(title, w, h, &win_proc);
+  if (IN->hwnd == 0) { return 0; }
+  ui_window_show(IN->hwnd);
+  var r: int32* = (int32*)malloc(16);
+  Win_GetClientRect(IN->hwnd, r);
+  IN->w = r[2] - r[0];
+  IN->h = r[3] - r[1];
+  free((uint8*)r);
+  input_lock(1);
+  return 1;
+}
+
+// seconds since the window opened
+fn now_s() -> float64 {
+  var c: int64 = 0;
+  Win_QueryPerformanceCounter(&c);
+  return (float64)(c - IN->t0) / (float64)IN->qpf;
+}
+
+// the frame's messages; the mouse's movement since the last frame. -> 0 once the window's closed
+fn win_pump() -> int32 {
+  var i: int32 = 0;
+  while (i < 256) { IN->hit[i] = (uint8)0; i = i + 1; }
+  IN->wheel = 0;
+  var msg: UiMsg;
+  while (Ui_PeekMessageA(&msg, 0, 0, 0, UI_PM_REMOVE()) != 0) {
+    if (msg.message == UI_WM_QUIT()) { IN->quit = 1; }
+    Ui_TranslateMessage(&msg);
+    Ui_DispatchMessageA(&msg);
+  }
+  IN->mdx = 0.0;
+  IN->mdy = 0.0;
+  if (IN->focus != 0 && Win_GetForegroundWindow() != IN->hwnd) { IN->focus = 0; input_lock(0); }
+  if (IN->locked != 0 && IN->focus != 0 && IN->nowarp == 0) {
+    var c: UiPoint;
+    c.x = IN->w / 2;
+    c.y = IN->h / 2;
+    Win_ClientToScreen(IN->hwnd, &c);
+    var cur: UiPoint;
+    Win_GetCursorPos(&cur);
+    if (IN->skip > 0) { IN->skip = IN->skip - 1; }
+    else {
+      IN->mdx = (float64)(cur.x - c.x);
+      IN->mdy = (float64)(cur.y - c.y);
+    }
+    Win_SetCursorPos(c.x, c.y);
+  }
+  if (IN->quit != 0) { return 0; }
+  return 1;
+}
+
+fn key(k: int32) -> int32 { if (IN->focus == 0) { return 0; } return (int32)IN->keys[k]; }
+fn key_hit(k: int32) -> int32 { return (int32)IN->hit[k]; }
