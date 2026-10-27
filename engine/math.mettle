@@ -1,8 +1,8 @@
 // Vectors, quaternions, 4x4 matrices (float32, column-major as GL takes them), a random source, and the small
-// helpers the Roblox code leans on (math.clamp, the eased rates 1 - e^(-k dt), angle wrap).
+// helpers a game leans on (clamp, the eased rates 1 - e^(-k dt), angle wrap).
 import "std/mem";
 
-// (std/math is imported by the entry file, reach.mettle: a module that imports an `export`-using one hides its own
+// (std/math is imported by the entry file: a module that imports an `export`-using one hides its own
 // undeclared-public types from its importers)
 
 // (the C runtime's double-precision math isn't on the internal linker's search: std/math's own)
@@ -78,7 +78,7 @@ fn vunit(a: Vec3) -> Vec3 {
   return vmul(a, 1.0 / l);
 }
 fn vdist(a: Vec3, b: Vec3) -> float64 { return vlen(vsub(a, b)); }
-// Roblox's frame: yaw 0 looks down -Z; the way a yaw faces, and the yaw of a way
+// the frame: yaw 0 looks down -Z; the way a yaw faces, and the yaw of a way
 fn fwd_of(yaw: float64) -> Vec3 { return v3(-m_sin(yaw), 0.0, -m_cos(yaw)); }
 fn right_of(yaw: float64) -> Vec3 { return v3(m_cos(yaw), 0.0, -m_sin(yaw)); }
 fn yaw_to(d: Vec3) -> float64 { return m_atan2(-d.x, -d.z); }
@@ -124,7 +124,7 @@ fn qlerp(a: Quat, b: Quat, t: float64) -> Quat {
   if (d < 0.0) { s = -1.0; }
   return qnorm(q4(a.x + (b.x * s - a.x) * t, a.y + (b.y * s - a.y) * t, a.z + (b.z * s - a.z) * t, a.w + (b.w * s - a.w) * t));
 }
-// Euler YXZ (Roblox's ToEulerAnglesYXZ / fromEulerAnglesYXZ): R = Ry(y) Rx(x) Rz(z)
+// Euler YXZ: R = Ry(y) Rx(x) Rz(z)
 fn qeuler_yxz(x: float64, y: float64, z: float64) -> Quat {
   return qmul(qmul(qaxis(v3(0.0, 1.0, 0.0), y), qaxis(v3(1.0, 0.0, 0.0), x)), qaxis(v3(0.0, 0.0, 1.0), z));
 }

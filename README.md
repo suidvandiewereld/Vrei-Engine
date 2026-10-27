@@ -1,7 +1,6 @@
 # Mettle engine
 
-A small game engine in Mettle, rendered with OpenGL 3.3 on Windows. It was split out of *Reach — on foot*
-(`C:\Projects\ReachFoot`) and knows nothing about any game.
+A small game engine in Mettle, rendered with OpenGL 3.3 on Windows. It knows nothing about any game.
 
 ## Modules
 

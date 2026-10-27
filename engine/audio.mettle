@@ -113,13 +113,13 @@ fn au_push(snd: int32, vl: float64, vr: float64, rate: float64, t0: float64, t1:
   au_publish(h + 1);
 }
 
-// in your head (2D): name's sound, how loud, how fast (the Roblox PlaybackSpeed: pitch with it), a little apart
+// in your head (2D): name's sound, how loud, how fast (pitch goes with it), a little apart
 fn sfx(snd: int32, vol: float64, rate: float64) { au_push(snd, vol, vol, rate * rnd_range(0.95, 1.05), 0.0, -1.0, 0.0, -1); }
 fn sfx_later(snd: int32, vol: float64, rate: float64, delay: float64) { au_push(snd, vol, vol, rate * rnd_range(0.95, 1.05), 0.0, -1.0, delay, -1); }
 // a part of a sound (t0..t1 s of it), after delay s
 fn sfx_part(snd: int32, vol: float64, rate: float64, t0: float64, t1: float64, delay: float64) { au_push(snd, vol, vol, rate, t0, t1, delay, -1); }
 
-// at a place in the world: quieter with distance (Roblox's InverseTapered roll-off: full within 5 m, gone by
+// at a place in the world: quieter with distance (an inverse-tapered roll-off: full within 5 m, gone by
 // 200), turned toward its side
 fn sfx_at(snd: int32, p: Vec3, vol: float64, rate: float64, delay: float64) {
   if (AU == 0) { return; }
