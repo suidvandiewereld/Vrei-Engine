@@ -1,22 +1,29 @@
-// smoke test: the engine with no game -- every renderer program built with the default extensions, a few frames of a
-// block on the ground under the sun (shadows, G-buffer, light, film); quits after 60 frames. 0: it all worked
+// smoke test: the engine with no game -- every pipeline built with the default extensions (validated: the Khronos
+// layer's errors and warnings printed), a few frames of a block on the ground under the sun (shadows, G-buffer, the
+// compute passes, light, film, an effect, the HUD), the window made bigger halfway (the swapchain and every target made
+// again); quits after 90 frames, the last frame saved (tests\engine_only.bmp) and the GPU's time a zone printed. 0:
+// it all worked
 import "std/io";
 import "std/mem";
 import "std/math";
 import "std/ui";
 import "engine/math";
 import "engine/win";
-import "engine/gl";
+import "engine/vk";
 import "engine/render";
+
+extern fn T_SetWindowPos(hwnd: int64, after: int64, x: int32, y: int32, w: int32, h: int32, flags: uint32) -> int32 = "SetWindowPos";
 
 fn main() -> int32 {
   if (win_open("engine only".chars, 640, 360) == 0) { return 1; }
-  if (gl_create(IN->hwnd) == 0) { return 2; }
+  vk_validation(1);
+  if (vk_create(IN->hwnd) == 0) { return 2; }
   if (render_init((Font*)0, IN->w, IN->h) == 0) { println("renderer failed"); return 3; }
   var cam: Vec3 = v3(0.0, 1.7, 6.0);
   var rot: Quat = qaxis(v3(1.0, 0.0, 0.0), -0.15);
   var f: int32 = 0;
-  while (f < 60 && win_pump() != 0) {
+  while (f < 90 && win_pump() != 0) {
+    if (f == 45) { T_SetWindowPos(IN->hwnd, 0, 0, 0, 900, 520, (uint32)0x0016); }   // (NOMOVE | NOZORDER | NOACTIVATE)
     frame_begin();
     var k: int32 = 0;
     while (k < 2) {
@@ -29,12 +36,26 @@ fn main() -> int32 {
     draw_ground();
     light_pass();
     fx_begin();
+    fx_blob(v3(1.6, 1.2, 0.5), 0.25, 3.0, 1.4, 0.4, 1.0);
     fx_flush();
     final_pass();
+    hud_rect(12.0, 12.0, 160.0, 6.0, 1.0, 0.8, 0.2, 0.8);
+    hud_flush();
     frame_end();
-    gl_swap();
+    vk_present();
     f = f + 1;
   }
-  println("engine only: {f} frames");
+  vk_idle();
+  var shown: int32 = R->frame_n;
+  println("engine only: {shown} frames of {f}");
+  var z: int32 = 0;
+  while (z < GZ_N()) {
+    var ms: float64 = R->gz_ms[z];
+    if (ms > 0.0) { print("  "); print_cstr(gz_name(z)); println(": {ms} ms"); }
+    z = z + 1;
+  }
+  var tot: float64 = R->gpu_total;
+  println("  GPU total: {tot} ms");
+  if (vk_save_bmp(&R->t_out, "tests/engine_only.bmp".chars) != 0) { println("saved tests/engine_only.bmp"); }
   return 0;
 }

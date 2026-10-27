@@ -1,6 +1,10 @@
-#version 330 core
-// tracers, flashes, puffs: world-space quads built on the CPU, already facing the camera
-in vec3 aPos; in vec2 aUv; in vec4 aCol;
-uniform mat4 uViewProj;
-out vec2 vUv; out vec4 vCol;
-void main() { vUv = aUv; vCol = aCol; gl_Position = uViewProj * vec4(aPos, 1.0); }
+// tracers, flashes, puffs: world-space quads built on the CPU, already facing the camera (DR.verts: as the HUD's)
+layout(location = 0) out vec2 vUv; layout(location = 1) out vec4 vCol;
+void main() {
+  Floats V = Floats(DR.verts);
+  uint o = uint(gl_VertexIndex) * 9u;
+  vec3 p = vec3(V.f[o], V.f[o + 1u], V.f[o + 2u]);
+  vUv = vec2(V.f[o + 3u], V.f[o + 4u]);
+  vCol = vec4(V.f[o + 5u], V.f[o + 6u], V.f[o + 7u], V.f[o + 8u]);
+  gl_Position = vkClip(uViewProj * vec4(p, 1.0));
+}

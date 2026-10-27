@@ -1,4 +1,3 @@
-#version 330 core
 // THE FRAME, 2: the light -- once a pixel, from the G-buffer, physically: every surface's albedo, normal, roughness
 // and metalness lit by
 //   the sun      a low warm sun, its light through two cascades of shadow map (soft-edged: sixteen taps on a rotated
@@ -15,30 +14,17 @@
 // the blue least), its creases not as dark
 // The sky pixels: the sky itself.
 // Out: the scene's light (HDR, linear).
-in vec2 vNdc;
-uniform sampler2D uAlbT;       // albedo (sRGB), occlusion
-uniform sampler2D uNrmT;       // normal, roughness
-uniform sampler2D uObjT;       // id, class, metalness, distance
-uniform sampler2D uEmiT;       // the light given off (sRGB, an eighth)
-uniform sampler2D uDepthT;
-uniform sampler2D uAOT;        // ambient occlusion (shaders/ao.frag, blurred)
-uniform sampler2D uPrevT;      // last frame's light (what the wet surfaces reflect)
-uniform sampler2DShadow uShadow;   // the sun's shadow map: two cascades side by side
-uniform mat4 uLightVP0;
-uniform mat4 uLightVP1;
-uniform vec2 uCascTexel;       // each cascade's texel (m)
-uniform vec2 uScreen;
-uniform mat4 uVP;
-uniform mat4 uInvVP;
-uniform mat4 uPrevVP;          // last frame's (where a point was on its frame)
-uniform vec3 uCamPos;
-uniform vec3 uSunDir;          // toward the sun
-uniform vec3 uSunCol;          // its light (the irradiance it gives, over pi)
-uniform vec3 uSkyCol;          // the sky's light from above, averaged
-uniform vec3 uGndCol;          // the ground's from below
-uniform vec3 uFogCol;
-uniform float uFogDen;
-out vec4 oC;
+// (the frame's -- the cascades, the camera, the sun's and the sky's light, the haze -- are the prelude's)
+layout(location = 0) in vec2 vNdc;
+#define uAlbT T2[DR.tex.x]     // albedo (sRGB), occlusion
+#define uNrmT T2[DR.tex.y]     // normal, roughness
+#define uObjT T2[DR.tex.z]     // id, class, metalness, distance
+#define uEmiT T2[DR.tex.w]     // the light given off (sRGB, an eighth)
+#define uDepthT T2[DR.tex2.x]
+#define uAOT T2[DR.tex2.y]     // ambient occlusion (shaders/ao.comp, blurred)
+#define uPrevT T2[DR.tex2.z]   // last frame's light (what the wet surfaces reflect)
+#define uShadow TS[DR.tex2.w]  // the sun's shadow map: two cascades side by side
+layout(location = 0) out vec4 oC;
 
 const float PI = 3.14159265;
 vec3 lin(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }

@@ -1,0 +1,12 @@
+#version 460
+// a gradient written straight into the target (its I8[] index in the push constants' second slot)
+#extension GL_EXT_nonuniform_qualifier : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 3, rgba8) uniform image2D I8[];
+layout(push_constant) uniform Push { uvec2 frame; uvec2 draw; uvec2 ext; uvec2 pad; } PC;
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 s = imageSize(I8[PC.draw.x]);
+  if (p.x >= s.x || p.y >= s.y) return;
+  imageStore(I8[PC.draw.x], p, vec4(vec2(p) / vec2(s) * 0.6, 0.25, 1.0));
+}

@@ -2,8 +2,8 @@
 // grime soaked up its foot, cracks, pits, the corners chipped paler; its surface from the same: the sand's grain, the
 // pits sunk into it, the cracks' grooves, the cast's corners rounded and chipped (the normal from its height either
 // side, the finest of it fading out before it's finer than a pixel)
-in vec3 vWp; in vec3 vN; in vec2 vUv;
-uniform vec3 uTint;
+layout(location = 0) in vec3 vWp; layout(location = 1) in vec3 vN; layout(location = 2) in vec2 vUv;
+layout(location = 3) in float vCav;  // (static.vert's: 0, the cube has no cavity)
 float noise(vec3 p) { return n3(p); }
 float fbm(vec3 p) { float s = 0.0, a = 0.5; for (int i = 0; i < 4; i++) { s += a * noise(p); p *= 2.07; a *= 0.5; } return s; }
 // the surface's height (m) along its normal at p; fw: a pixel there
@@ -36,7 +36,7 @@ void main() {
   vec2 e2 = min(vUv, 1.0 - vUv);
   float edge = 1.0 - smoothstep(0.0, 0.035, min(e2.x, e2.y) + (noise(p * 9.0) - 0.5) * 0.03);
   alb = mix(alb, tint * 1.3, edge * 0.45);
-  float occ = 1.0 - 0.12 * pit;
+  float occ = (1.0 - 0.12 * pit) * (1.0 - 0.75 * vCav);
   // ---- its surface: across the face (t1, t2), the height either side
   vec3 an = abs(n0);
   vec3 t1 = an.x > 0.5 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);

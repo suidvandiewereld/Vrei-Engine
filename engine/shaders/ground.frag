@@ -2,7 +2,7 @@
 // the hollows), patches of dry grass, a fine grain of sand in it; its surface from the same: the lie of the land, the
 // small clods and ruts of trodden dirt, the grit (the normal from its height either side, the finest of it fading out
 // before it's finer than a pixel)
-in vec3 vWp;
+layout(location = 0) in vec3 vWp;
 float hash(vec2 p) { vec3 q = fract(vec3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
 float noise(vec2 p) {
   vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);

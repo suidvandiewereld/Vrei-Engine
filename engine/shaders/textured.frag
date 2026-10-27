@@ -2,11 +2,10 @@
 // b a), the sculpt's creases occluding the light (the cavity), a hit's flash. Back faces (double-sided meshes) take the
 // flipped normal. The extension (RX_SURFACE_FS) may throw a fragment away first (ext_clip) and changes the surface
 // after (ext_surface): what it's made of, the light it gives off, a height over it (m) that bends its normal.
-in vec3 vWp; in vec3 vN; in vec2 vUv; in float vCav;
-uniform sampler2D uTex;        // the colour (sRGB)
-uniform sampler2D uSurf;       // r roughness, g metalness, b a the normal map's x y
-uniform vec3 uTint;
-uniform float uGlow;
+layout(location = 0) in vec3 vWp; layout(location = 1) in vec3 vN; layout(location = 2) in vec2 vUv;
+layout(location = 3) in float vCav;
+#define uTex T2[DR.tex.x]      // the colour (sRGB)
+#define uSurf T2[DR.tex.y]     // r roughness, g metalness, b a the normal map's x y
 // a little height over the surface (m) bends its normal (Mikkelsen's surface gradient, by the screen's derivatives)
 vec3 bumpH(vec3 n, float h) {
   vec3 dpx = dFdx(vWp), dpy = dFdy(vWp);

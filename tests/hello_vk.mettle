@@ -1,0 +1,52 @@
+// smoke test of the Vulkan layer alone: a window, the device (validated), a compute pass writing a gradient into a
+// target through the bindless storage array, a triangle drawn over it, the picture blitted onto the swapchain; quits
+// after 120 frames. 0: it all worked
+import "std/io";
+import "std/mem";
+import "std/ui";
+import "engine/win";
+import "engine/vk";
+import "engine/vkc";
+import "test_shader_src";
+
+
+fn main() -> int32 {
+  if (win_open("hello vulkan".chars, 640, 360) == 0) { return 1; }
+  vk_validation(1);
+  if (vk_create(IN->hwnd) == 0) { println("vulkan failed"); return 2; }
+  var D: GfxDesc;
+  D.vs = vk_glsl(SHK_VERTEX(), SRC_hello_vk_vert.chars, "hello_vk.vert".chars);
+  D.fs = vk_glsl(SHK_FRAGMENT(), SRC_hello_vk_frag.chars, "hello_vk.frag".chars);
+  D.ncol = 1;
+  D.cfmt[0] = VK_FORMAT_R8G8B8A8_UNORM();
+  D.dfmt = VK_FORMAT_UNDEFINED();
+  D.dcmp = VK_COMPARE_OP_ALWAYS();
+  D.cull = VK_CULL_MODE_NONE();
+  var tri: int64 = vk_pipeline_gfx(&D, "hello triangle".chars);
+  var grad: int64 = vk_pipeline_compute(vk_glsl(SHK_COMPUTE(), SRC_hello_vk_comp.chars, "hello_vk.comp".chars), "hello gradient".chars);
+  if (tri == 0 || grad == 0) { return 3; }
+  var T: VkImg* = new VkImg;
+  var usage: uint32 = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT() | VK_IMAGE_USAGE_STORAGE_BIT() | VK_IMAGE_USAGE_TRANSFER_SRC_BIT();
+  var f: int32 = 0;
+  var shown: int32 = 0;
+  while (f < 120 && win_pump() != 0) {
+    if (vk_frame_begin() != 0) {
+      if (vk_target(T, IN->w, IN->h, VK_FORMAT_R8G8B8A8_UNORM(), usage, SMP_LINEAR()) == 0) { return 4; }
+      vk_write_cs(T);
+      vk_bind_compute(grad);
+      vk_push(0, (int64)T->stor, 0);
+      vk_dispatch(T->w, T->h);
+      vk_render_begin(T, (VkImg*)0, (VkImg*)0, (VkImg*)0, (VkImg*)0, 0, 0);
+      vk_bind_gfx(tri);
+      vk_draw(3);
+      vk_render_end();
+      vk_frame_end(T);
+      vk_present();
+      shown = shown + 1;
+    }
+    f = f + 1;
+  }
+  vk_idle();
+  println("hello vulkan: {shown} frames shown of {f}");
+  return 0;
+}

@@ -1,0 +1,21 @@
+// THE FRAME, 3b: the glow's chain up, a compute pass a level: each smaller level (T2[DR.tex.x]) spread by a 3x3 tent
+// and added onto the one above it (I16[DR.tex.w], DR.p1.zw texels: read, added to, written back), so the glow has
+// every width at once -- a tight core, a wide breath
+layout(local_size_x = 8, local_size_y = 8) in;
+#define uSrc T2[DR.tex.x]
+#define uTexel DR.p0.xy        // the source's texel
+#define uRadius DR.p0.z
+void main() {
+  ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+  vec2 size = DR.p1.zw;
+  if (ip.x >= int(size.x) || ip.y >= int(size.y)) return;
+  vec2 uv = (vec2(ip) + 0.5) / size;
+  vec2 t = uTexel * uRadius;
+  vec3 s = textureLod(uSrc, uv, 0.0).rgb * 4.0;
+  s += (textureLod(uSrc, uv + vec2(-t.x, 0), 0.0).rgb + textureLod(uSrc, uv + vec2(t.x, 0), 0.0).rgb
+      + textureLod(uSrc, uv + vec2(0, -t.y), 0.0).rgb + textureLod(uSrc, uv + vec2(0, t.y), 0.0).rgb) * 2.0;
+  s += textureLod(uSrc, uv + vec2(-t.x, -t.y), 0.0).rgb + textureLod(uSrc, uv + vec2(t.x, -t.y), 0.0).rgb
+     + textureLod(uSrc, uv + vec2(-t.x, t.y), 0.0).rgb + textureLod(uSrc, uv + vec2(t.x, t.y), 0.0).rgb;
+  vec4 dst = imageLoad(I16[DR.tex.w], ip);
+  imageStore(I16[DR.tex.w], ip, vec4(dst.rgb + s / 16.0, 1.0));
+}

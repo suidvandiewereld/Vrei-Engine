@@ -1,0 +1,1716 @@
+// Vulkan 1.4 on Win32 (nothing past 1.3 core is required, so any 1.3 driver runs it): vulkan-1.dll loaded at run time,
+// its entry points fetched once into one table and called through typed function pointers. What the engine builds on:
+//   the device      one queue for graphics, compute and present; Vulkan 1.3's dynamic rendering and synchronization2
+//                   (no render pass objects); buffer device addresses (shaders read their data through pointers)
+//   bindless        one descriptor set for the whole run: every texture an index into one array (T2[] in GLSL), every
+//                   storage image one into another (I16[] / I8[]), the shadow map's compare sampler into a third (TS[])
+//   the frame's     data written each frame into a ring of host-visible memory and read by the GPU through its address
+//                   (push constants carry the frame's, the draw's, the game's extension's)
+//   the frame       two frames in flight; the swapchain recreated on resize; the frame's image blitted onto it
+//   shaders         GLSL compiled to SPIR-V at run time by shaderc (shaderc_shared.dll, beside the exe or on PATH), so a
+//                   game's GLSL is spliced in as it always was
+//   validation      the Khronos validation layer when METTLE_VK_VALIDATE=1 (or vk_validation(1) before vk_create)
+// Conventions: the engine's math is GL's (clip depth -1..1, NDC y up) -- the shaders map clip depth to 0..1 (vkClip)
+// so the depth stored is GL's, and NDC -1 is image row 0 in both, so every screen-space pass reads its targets as it
+// did; the picture is flipped once, onto the swapchain (vk_frame_end). Front faces are counter-clockwise as in GL
+// (VK_FRONT_FACE_CLOCKWISE, Vulkan's area having the opposite sign).
+import "std/io";
+import "std/mem";
+import "vkc";
+
+extern fn Vk_LoadLibraryA(name: cstring) -> int64 = "LoadLibraryA";
+extern fn Vk_GetProcAddress(m: int64, name: cstring) -> int64 = "GetProcAddress";
+extern fn Vk_GetModuleHandleA(name: cstring) -> int64 = "GetModuleHandleA";
+extern fn Vk_GetEnvironmentVariableA(name: cstring, buf: uint8*, n: uint32) -> uint32 = "GetEnvironmentVariableA";
+extern fn Vk_GetClientRect(hwnd: int64, r: int32*) -> int32 = "GetClientRect";
+
+// ---------------------------------------------------------------- the C structs (layouts checked by vk_layout_ok)
+struct VkApplicationInfo { sType: uint32; pNext: uint8*; pApplicationName: cstring; applicationVersion: uint32;
+  pEngineName: cstring; engineVersion: uint32; apiVersion: uint32; }
+struct VkInstanceCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; pApplicationInfo: VkApplicationInfo*;
+  enabledLayerCount: uint32; ppEnabledLayerNames: cstring*; enabledExtensionCount: uint32; ppEnabledExtensionNames: cstring*; }
+struct VkDebugUtilsMessengerCreateInfoEXT { sType: uint32; pNext: uint8*; flags: uint32; messageSeverity: uint32;
+  messageType: uint32; pfnUserCallback: fn(uint32, uint32, uint8*, uint8*) -> uint32; pUserData: uint8*; }
+struct VkWin32SurfaceCreateInfoKHR { sType: uint32; pNext: uint8*; flags: uint32; hinstance: int64; hwnd: int64; }
+struct VkDeviceQueueCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; queueFamilyIndex: uint32; queueCount: uint32;
+  pQueuePriorities: float32*; }
+struct VkDeviceCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; queueCreateInfoCount: uint32;
+  pQueueCreateInfos: VkDeviceQueueCreateInfo*; enabledLayerCount: uint32; ppEnabledLayerNames: cstring*;
+  enabledExtensionCount: uint32; ppEnabledExtensionNames: cstring*; pEnabledFeatures: uint8*; }
+// the feature structs: their VkBool32s as arrays (indices from the SDK's offsets: see VK12_* / VK13_*)
+struct VkFeatures2 { sType: uint32; pNext: uint8*; f: uint32[55]; }
+struct VkFeatures12 { sType: uint32; pNext: uint8*; f: uint32[47]; }
+struct VkFeatures13 { sType: uint32; pNext: uint8*; f: uint32[15]; }
+struct VkSwapchainCreateInfoKHR { sType: uint32; pNext: uint8*; flags: uint32; surface: int64; minImageCount: uint32;
+  imageFormat: uint32; imageColorSpace: uint32; width: uint32; height: uint32; imageArrayLayers: uint32; imageUsage: uint32;
+  imageSharingMode: uint32; queueFamilyIndexCount: uint32; pQueueFamilyIndices: uint32*; preTransform: uint32;
+  compositeAlpha: uint32; presentMode: uint32; clipped: uint32; oldSwapchain: int64; }
+struct VkPresentInfoKHR { sType: uint32; pNext: uint8*; waitSemaphoreCount: uint32; pWaitSemaphores: int64*;
+  swapchainCount: uint32; pSwapchains: int64*; pImageIndices: uint32*; pResults: int32*; }
+struct VkCommandPoolCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; queueFamilyIndex: uint32; }
+struct VkCommandBufferAllocateInfo { sType: uint32; pNext: uint8*; commandPool: int64; level: uint32; commandBufferCount: uint32; }
+struct VkCommandBufferBeginInfo { sType: uint32; pNext: uint8*; flags: uint32; pInheritanceInfo: uint8*; }
+struct VkSubmitInfo { sType: uint32; pNext: uint8*; waitSemaphoreCount: uint32; pWaitSemaphores: int64*;
+  pWaitDstStageMask: uint32*; commandBufferCount: uint32; pCommandBuffers: int64*; signalSemaphoreCount: uint32;
+  pSignalSemaphores: int64*; }
+struct VkFenceCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; }
+struct VkSemaphoreCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; }
+struct VkBufferCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; size: int64; usage: uint32; sharingMode: uint32;
+  queueFamilyIndexCount: uint32; pQueueFamilyIndices: uint32*; }
+struct VkMemoryRequirements { size: int64; alignment: int64; memoryTypeBits: uint32; }
+struct VkMemoryAllocateInfo { sType: uint32; pNext: uint8*; allocationSize: int64; memoryTypeIndex: uint32; }
+struct VkMemoryAllocateFlagsInfo { sType: uint32; pNext: uint8*; flags: uint32; deviceMask: uint32; }
+struct VkBufferDeviceAddressInfo { sType: uint32; pNext: uint8*; buffer: int64; }
+struct VkImageCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; imageType: uint32; format: uint32; width: uint32;
+  height: uint32; depth: uint32; mipLevels: uint32; arrayLayers: uint32; samples: uint32; tiling: uint32; usage: uint32;
+  sharingMode: uint32; queueFamilyIndexCount: uint32; pQueueFamilyIndices: uint32*; initialLayout: uint32; }
+struct VkImageViewCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; image: int64; viewType: uint32; format: uint32;
+  components: uint32[4]; aspectMask: uint32; baseMipLevel: uint32; levelCount: uint32; baseArrayLayer: uint32; layerCount: uint32; }
+struct VkSamplerCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; magFilter: uint32; minFilter: uint32;
+  mipmapMode: uint32; addressModeU: uint32; addressModeV: uint32; addressModeW: uint32; mipLodBias: float32;
+  anisotropyEnable: uint32; maxAnisotropy: float32; compareEnable: uint32; compareOp: uint32; minLod: float32;
+  maxLod: float32; borderColor: uint32; unnormalizedCoordinates: uint32; }
+struct VkBufferImageCopy { bufferOffset: int64; bufferRowLength: uint32; bufferImageHeight: uint32; aspectMask: uint32;
+  mipLevel: uint32; baseArrayLayer: uint32; layerCount: uint32; x: int32; y: int32; z: int32; width: uint32; height: uint32;
+  depth: uint32; }
+struct VkImageBlit { src_aspect: uint32; src_mip: uint32; src_layer: uint32; src_layers: uint32; src_off: int32[6];
+  dst_aspect: uint32; dst_mip: uint32; dst_layer: uint32; dst_layers: uint32; dst_off: int32[6]; }
+struct VkImageMemoryBarrier2 { sType: uint32; pNext: uint8*; srcStageMask: int64; srcAccessMask: int64; dstStageMask: int64;
+  dstAccessMask: int64; oldLayout: uint32; newLayout: uint32; srcQueueFamilyIndex: uint32; dstQueueFamilyIndex: uint32;
+  image: int64; aspectMask: uint32; baseMipLevel: uint32; levelCount: uint32; baseArrayLayer: uint32; layerCount: uint32; }
+struct VkMemoryBarrier2 { sType: uint32; pNext: uint8*; srcStageMask: int64; srcAccessMask: int64; dstStageMask: int64;
+  dstAccessMask: int64; }
+struct VkDependencyInfo { sType: uint32; pNext: uint8*; dependencyFlags: uint32; memoryBarrierCount: uint32;
+  pMemoryBarriers: VkMemoryBarrier2*; bufferMemoryBarrierCount: uint32; pBufferMemoryBarriers: uint8*;
+  imageMemoryBarrierCount: uint32; pImageMemoryBarriers: VkImageMemoryBarrier2*; }
+struct VkRenderingAttachmentInfo { sType: uint32; pNext: uint8*; imageView: int64; imageLayout: uint32; resolveMode: uint32;
+  resolveImageView: int64; resolveImageLayout: uint32; loadOp: uint32; storeOp: uint32; clear: float32[4]; }
+struct VkRenderingInfo { sType: uint32; pNext: uint8*; flags: uint32; x: int32; y: int32; width: uint32; height: uint32;
+  layerCount: uint32; viewMask: uint32; colorAttachmentCount: uint32; pColorAttachments: VkRenderingAttachmentInfo*;
+  pDepthAttachment: VkRenderingAttachmentInfo*; pStencilAttachment: VkRenderingAttachmentInfo*; }
+struct VkPipelineRenderingCreateInfo { sType: uint32; pNext: uint8*; viewMask: uint32; colorAttachmentCount: uint32;
+  pColorAttachmentFormats: uint32*; depthAttachmentFormat: uint32; stencilAttachmentFormat: uint32; }
+struct VkDescriptorSetLayoutBinding { binding: uint32; descriptorType: uint32; descriptorCount: uint32; stageFlags: uint32;
+  pImmutableSamplers: int64*; }
+struct VkDescriptorSetLayoutCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; bindingCount: uint32;
+  pBindings: VkDescriptorSetLayoutBinding*; }
+struct VkDescriptorSetLayoutBindingFlagsCreateInfo { sType: uint32; pNext: uint8*; bindingCount: uint32; pBindingFlags: uint32*; }
+struct VkDescriptorPoolSize { typ: uint32; descriptorCount: uint32; }
+struct VkDescriptorPoolCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; maxSets: uint32; poolSizeCount: uint32;
+  pPoolSizes: VkDescriptorPoolSize*; }
+struct VkDescriptorSetAllocateInfo { sType: uint32; pNext: uint8*; descriptorPool: int64; descriptorSetCount: uint32;
+  pSetLayouts: int64*; }
+struct VkDescriptorImageInfo { sampler: int64; imageView: int64; imageLayout: uint32; }
+struct VkWriteDescriptorSet { sType: uint32; pNext: uint8*; dstSet: int64; dstBinding: uint32; dstArrayElement: uint32;
+  descriptorCount: uint32; descriptorType: uint32; pImageInfo: VkDescriptorImageInfo*; pBufferInfo: uint8*;
+  pTexelBufferView: uint8*; }
+struct VkShaderModuleCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; codeSize: int64; pCode: uint8*; }
+struct VkPipelineShaderStageCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; stage: uint32; module_: int64;
+  pName: cstring; pSpecializationInfo: uint8*; }
+struct VkPushConstantRange { stageFlags: uint32; offset: uint32; size: uint32; }
+struct VkPipelineLayoutCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; setLayoutCount: uint32; pSetLayouts: int64*;
+  pushConstantRangeCount: uint32; pPushConstantRanges: VkPushConstantRange*; }
+struct VkPipelineVertexInputStateCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; vertexBindingDescriptionCount: uint32;
+  pVertexBindingDescriptions: uint8*; vertexAttributeDescriptionCount: uint32; pVertexAttributeDescriptions: uint8*; }
+struct VkPipelineInputAssemblyStateCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; topology: uint32;
+  primitiveRestartEnable: uint32; }
+struct VkPipelineViewportStateCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; viewportCount: uint32;
+  pViewports: uint8*; scissorCount: uint32; pScissors: uint8*; }
+struct VkPipelineRasterizationStateCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; depthClampEnable: uint32;
+  rasterizerDiscardEnable: uint32; polygonMode: uint32; cullMode: uint32; frontFace: uint32; depthBiasEnable: uint32;
+  depthBiasConstantFactor: float32; depthBiasClamp: float32; depthBiasSlopeFactor: float32; lineWidth: float32; }
+struct VkPipelineMultisampleStateCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; rasterizationSamples: uint32;
+  sampleShadingEnable: uint32; minSampleShading: float32; pSampleMask: uint32*; alphaToCoverageEnable: uint32;
+  alphaToOneEnable: uint32; }
+struct VkPipelineDepthStencilStateCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; depthTestEnable: uint32;
+  depthWriteEnable: uint32; depthCompareOp: uint32; depthBoundsTestEnable: uint32; stencilTestEnable: uint32;
+  front: uint32[7]; back: uint32[7]; minDepthBounds: float32; maxDepthBounds: float32; }
+struct VkPipelineColorBlendAttachmentState { blendEnable: uint32; srcColorBlendFactor: uint32; dstColorBlendFactor: uint32;
+  colorBlendOp: uint32; srcAlphaBlendFactor: uint32; dstAlphaBlendFactor: uint32; alphaBlendOp: uint32; colorWriteMask: uint32; }
+struct VkPipelineColorBlendStateCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; logicOpEnable: uint32; logicOp: uint32;
+  attachmentCount: uint32; pAttachments: VkPipelineColorBlendAttachmentState*; blendConstants: float32[4]; }
+struct VkPipelineDynamicStateCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; dynamicStateCount: uint32;
+  pDynamicStates: uint32*; }
+struct VkGraphicsPipelineCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; stageCount: uint32;
+  pStages: VkPipelineShaderStageCreateInfo*; pVertexInputState: VkPipelineVertexInputStateCreateInfo*;
+  pInputAssemblyState: VkPipelineInputAssemblyStateCreateInfo*; pTessellationState: uint8*;
+  pViewportState: VkPipelineViewportStateCreateInfo*; pRasterizationState: VkPipelineRasterizationStateCreateInfo*;
+  pMultisampleState: VkPipelineMultisampleStateCreateInfo*; pDepthStencilState: VkPipelineDepthStencilStateCreateInfo*;
+  pColorBlendState: VkPipelineColorBlendStateCreateInfo*; pDynamicState: VkPipelineDynamicStateCreateInfo*;
+  layout_: int64; renderPass: int64; subpass: uint32; basePipelineHandle: int64; basePipelineIndex: int32; }
+struct VkComputePipelineCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; stage: VkPipelineShaderStageCreateInfo;
+  layout_: int64; basePipelineHandle: int64; basePipelineIndex: int32; }
+struct VkViewport { x: float32; y: float32; width: float32; height: float32; minDepth: float32; maxDepth: float32; }
+struct VkRect2D { x: int32; y: int32; width: uint32; height: uint32; }
+struct VkQueryPoolCreateInfo { sType: uint32; pNext: uint8*; flags: uint32; queryType: uint32; queryCount: uint32;
+  pipelineStatistics: uint32; }
+
+fn vk_size(name: cstring, got: int64, want: int64) -> int32 {
+  if (got == want) { return 1; }
+  print("vk: struct layout mismatch: "); println_cstr(name);
+  return 0;
+}
+// each mirrored struct's size against the SDK headers' (tools/vkc_gen.c's companion dump): a wrong one is a crash later
+fn vk_layout_ok() -> int32 {
+  var ok: int32 = 1;
+  ok = ok & vk_size("VkApplicationInfo".chars, (int64)sizeof(VkApplicationInfo), 48);
+  ok = ok & vk_size("VkInstanceCreateInfo".chars, (int64)sizeof(VkInstanceCreateInfo), 64);
+  ok = ok & vk_size("VkDebugUtilsMessengerCreateInfoEXT".chars, (int64)sizeof(VkDebugUtilsMessengerCreateInfoEXT), 48);
+  ok = ok & vk_size("VkWin32SurfaceCreateInfoKHR".chars, (int64)sizeof(VkWin32SurfaceCreateInfoKHR), 40);
+  ok = ok & vk_size("VkDeviceQueueCreateInfo".chars, (int64)sizeof(VkDeviceQueueCreateInfo), 40);
+  ok = ok & vk_size("VkDeviceCreateInfo".chars, (int64)sizeof(VkDeviceCreateInfo), 72);
+  ok = ok & vk_size("VkPhysicalDeviceFeatures2".chars, (int64)sizeof(VkFeatures2), 240);
+  ok = ok & vk_size("VkPhysicalDeviceVulkan12Features".chars, (int64)sizeof(VkFeatures12), 208);
+  ok = ok & vk_size("VkPhysicalDeviceVulkan13Features".chars, (int64)sizeof(VkFeatures13), 80);
+  ok = ok & vk_size("VkSwapchainCreateInfoKHR".chars, (int64)sizeof(VkSwapchainCreateInfoKHR), 104);
+  ok = ok & vk_size("VkPresentInfoKHR".chars, (int64)sizeof(VkPresentInfoKHR), 64);
+  ok = ok & vk_size("VkCommandPoolCreateInfo".chars, (int64)sizeof(VkCommandPoolCreateInfo), 24);
+  ok = ok & vk_size("VkCommandBufferAllocateInfo".chars, (int64)sizeof(VkCommandBufferAllocateInfo), 32);
+  ok = ok & vk_size("VkCommandBufferBeginInfo".chars, (int64)sizeof(VkCommandBufferBeginInfo), 32);
+  ok = ok & vk_size("VkSubmitInfo".chars, (int64)sizeof(VkSubmitInfo), 72);
+  ok = ok & vk_size("VkFenceCreateInfo".chars, (int64)sizeof(VkFenceCreateInfo), 24);
+  ok = ok & vk_size("VkBufferCreateInfo".chars, (int64)sizeof(VkBufferCreateInfo), 56);
+  ok = ok & vk_size("VkMemoryRequirements".chars, (int64)sizeof(VkMemoryRequirements), 24);
+  ok = ok & vk_size("VkMemoryAllocateInfo".chars, (int64)sizeof(VkMemoryAllocateInfo), 32);
+  ok = ok & vk_size("VkMemoryAllocateFlagsInfo".chars, (int64)sizeof(VkMemoryAllocateFlagsInfo), 24);
+  ok = ok & vk_size("VkBufferDeviceAddressInfo".chars, (int64)sizeof(VkBufferDeviceAddressInfo), 24);
+  ok = ok & vk_size("VkImageCreateInfo".chars, (int64)sizeof(VkImageCreateInfo), 88);
+  ok = ok & vk_size("VkImageViewCreateInfo".chars, (int64)sizeof(VkImageViewCreateInfo), 80);
+  ok = ok & vk_size("VkSamplerCreateInfo".chars, (int64)sizeof(VkSamplerCreateInfo), 80);
+  ok = ok & vk_size("VkBufferImageCopy".chars, (int64)sizeof(VkBufferImageCopy), 56);
+  ok = ok & vk_size("VkImageBlit".chars, (int64)sizeof(VkImageBlit), 80);
+  ok = ok & vk_size("VkImageMemoryBarrier2".chars, (int64)sizeof(VkImageMemoryBarrier2), 96);
+  ok = ok & vk_size("VkMemoryBarrier2".chars, (int64)sizeof(VkMemoryBarrier2), 48);
+  ok = ok & vk_size("VkDependencyInfo".chars, (int64)sizeof(VkDependencyInfo), 64);
+  ok = ok & vk_size("VkRenderingAttachmentInfo".chars, (int64)sizeof(VkRenderingAttachmentInfo), 72);
+  ok = ok & vk_size("VkRenderingInfo".chars, (int64)sizeof(VkRenderingInfo), 72);
+  ok = ok & vk_size("VkPipelineRenderingCreateInfo".chars, (int64)sizeof(VkPipelineRenderingCreateInfo), 40);
+  ok = ok & vk_size("VkDescriptorSetLayoutBinding".chars, (int64)sizeof(VkDescriptorSetLayoutBinding), 24);
+  ok = ok & vk_size("VkDescriptorSetLayoutCreateInfo".chars, (int64)sizeof(VkDescriptorSetLayoutCreateInfo), 32);
+  ok = ok & vk_size("VkDescriptorSetLayoutBindingFlagsCreateInfo".chars, (int64)sizeof(VkDescriptorSetLayoutBindingFlagsCreateInfo), 32);
+  ok = ok & vk_size("VkDescriptorPoolCreateInfo".chars, (int64)sizeof(VkDescriptorPoolCreateInfo), 40);
+  ok = ok & vk_size("VkDescriptorSetAllocateInfo".chars, (int64)sizeof(VkDescriptorSetAllocateInfo), 40);
+  ok = ok & vk_size("VkDescriptorImageInfo".chars, (int64)sizeof(VkDescriptorImageInfo), 24);
+  ok = ok & vk_size("VkWriteDescriptorSet".chars, (int64)sizeof(VkWriteDescriptorSet), 64);
+  ok = ok & vk_size("VkShaderModuleCreateInfo".chars, (int64)sizeof(VkShaderModuleCreateInfo), 40);
+  ok = ok & vk_size("VkPipelineShaderStageCreateInfo".chars, (int64)sizeof(VkPipelineShaderStageCreateInfo), 48);
+  ok = ok & vk_size("VkPushConstantRange".chars, (int64)sizeof(VkPushConstantRange), 12);
+  ok = ok & vk_size("VkPipelineLayoutCreateInfo".chars, (int64)sizeof(VkPipelineLayoutCreateInfo), 48);
+  ok = ok & vk_size("VkPipelineVertexInputStateCreateInfo".chars, (int64)sizeof(VkPipelineVertexInputStateCreateInfo), 48);
+  ok = ok & vk_size("VkPipelineInputAssemblyStateCreateInfo".chars, (int64)sizeof(VkPipelineInputAssemblyStateCreateInfo), 32);
+  ok = ok & vk_size("VkPipelineViewportStateCreateInfo".chars, (int64)sizeof(VkPipelineViewportStateCreateInfo), 48);
+  ok = ok & vk_size("VkPipelineRasterizationStateCreateInfo".chars, (int64)sizeof(VkPipelineRasterizationStateCreateInfo), 64);
+  ok = ok & vk_size("VkPipelineMultisampleStateCreateInfo".chars, (int64)sizeof(VkPipelineMultisampleStateCreateInfo), 48);
+  ok = ok & vk_size("VkPipelineDepthStencilStateCreateInfo".chars, (int64)sizeof(VkPipelineDepthStencilStateCreateInfo), 104);
+  ok = ok & vk_size("VkPipelineColorBlendAttachmentState".chars, (int64)sizeof(VkPipelineColorBlendAttachmentState), 32);
+  ok = ok & vk_size("VkPipelineColorBlendStateCreateInfo".chars, (int64)sizeof(VkPipelineColorBlendStateCreateInfo), 56);
+  ok = ok & vk_size("VkPipelineDynamicStateCreateInfo".chars, (int64)sizeof(VkPipelineDynamicStateCreateInfo), 32);
+  ok = ok & vk_size("VkGraphicsPipelineCreateInfo".chars, (int64)sizeof(VkGraphicsPipelineCreateInfo), 144);
+  ok = ok & vk_size("VkComputePipelineCreateInfo".chars, (int64)sizeof(VkComputePipelineCreateInfo), 96);
+  ok = ok & vk_size("VkViewport".chars, (int64)sizeof(VkViewport), 24);
+  ok = ok & vk_size("VkRect2D".chars, (int64)sizeof(VkRect2D), 16);
+  ok = ok & vk_size("VkQueryPoolCreateInfo".chars, (int64)sizeof(VkQueryPoolCreateInfo), 32);
+  return ok;
+}
+
+// the feature bits the engine turns on (their indices in the structs' VkBool32 arrays)
+fn VK10_SAMPLER_ANISOTROPY() -> int32 { return 19; }
+fn VK10_SAMPLED_DYNAMIC_INDEXING() -> int32 { return 34; }
+fn VK10_STORAGE_DYNAMIC_INDEXING() -> int32 { return 36; }
+fn VK12_DESCRIPTOR_INDEXING() -> int32 { return 9; }
+fn VK12_SAMPLED_NONUNIFORM() -> int32 { return 14; }
+fn VK12_STORAGE_NONUNIFORM() -> int32 { return 16; }
+fn VK12_SAMPLED_UPDATE_AFTER_BIND() -> int32 { return 21; }
+fn VK12_STORAGE_UPDATE_AFTER_BIND() -> int32 { return 22; }
+fn VK12_UPDATE_UNUSED_WHILE_PENDING() -> int32 { return 26; }
+fn VK12_PARTIALLY_BOUND() -> int32 { return 27; }
+fn VK12_RUNTIME_ARRAY() -> int32 { return 29; }
+fn VK12_BUFFER_DEVICE_ADDRESS() -> int32 { return 38; }
+fn VK13_SYNCHRONIZATION2() -> int32 { return 9; }
+fn VK13_DYNAMIC_RENDERING() -> int32 { return 12; }
+fn VK13_MAINTENANCE4() -> int32 { return 14; }
+
+// ---------------------------------------------------------------- the entry points
+struct VkProcs {
+  GetInstanceProcAddr: int64; GetDeviceProcAddr: int64; CreateInstance: int64;
+  EnumeratePhysicalDevices: int64; GetPhysicalDeviceProperties: int64; GetPhysicalDeviceQueueFamilyProperties: int64;
+  GetPhysicalDeviceMemoryProperties: int64; GetPhysicalDeviceFeatures2: int64; GetPhysicalDeviceSurfaceSupportKHR: int64;
+  GetPhysicalDeviceSurfaceCapabilitiesKHR: int64; GetPhysicalDeviceSurfaceFormatsKHR: int64;
+  GetPhysicalDeviceSurfacePresentModesKHR: int64; CreateWin32SurfaceKHR: int64; CreateDebugUtilsMessengerEXT: int64;
+  CreateDevice: int64;
+  GetDeviceQueue: int64; DeviceWaitIdle: int64; CreateSwapchainKHR: int64; DestroySwapchainKHR: int64;
+  GetSwapchainImagesKHR: int64; AcquireNextImageKHR: int64; QueuePresentKHR: int64; QueueSubmit: int64; QueueWaitIdle: int64;
+  CreateCommandPool: int64; AllocateCommandBuffers: int64; BeginCommandBuffer: int64; EndCommandBuffer: int64;
+  ResetCommandBuffer: int64; CreateFence: int64; WaitForFences: int64; ResetFences: int64; CreateSemaphore: int64;
+  CreateBuffer: int64; DestroyBuffer: int64; GetBufferMemoryRequirements: int64; AllocateMemory: int64; FreeMemory: int64;
+  BindBufferMemory: int64; MapMemory: int64; GetBufferDeviceAddress: int64; CreateImage: int64; DestroyImage: int64;
+  GetImageMemoryRequirements: int64; BindImageMemory: int64; CreateImageView: int64; DestroyImageView: int64;
+  CreateSampler: int64; CreateDescriptorSetLayout: int64; CreateDescriptorPool: int64; AllocateDescriptorSets: int64;
+  UpdateDescriptorSets: int64; CreateShaderModule: int64; DestroyShaderModule: int64; CreatePipelineLayout: int64;
+  CreateGraphicsPipelines: int64; CreateComputePipelines: int64; CreateQueryPool: int64; GetQueryPoolResults: int64;
+  CmdPipelineBarrier2: int64; CmdBeginRendering: int64; CmdEndRendering: int64; CmdBindPipeline: int64;
+  CmdBindDescriptorSets: int64; CmdPushConstants: int64; CmdSetViewport: int64; CmdSetScissor: int64; CmdSetDepthBias: int64;
+  CmdDraw: int64; CmdDrawIndexed: int64; CmdBindIndexBuffer: int64; CmdDispatch: int64; CmdCopyBuffer: int64;
+  CmdCopyBufferToImage: int64; CmdBlitImage: int64; CmdWriteTimestamp2: int64; CmdResetQueryPool: int64;
+  CmdClearColorImage: int64; CmdCopyImageToBuffer: int64;
+}
+var vkp: VkProcs* = 0;
+
+// shaderc's C API (shaderc_shared.dll)
+struct ShadercProcs { init: int64; opts_init: int64; set_env: int64; set_opt: int64; compile: int64; status: int64;
+  length: int64; bytes: int64; err: int64; release: int64; compiler: int64; opts: int64; }
+var shc: ShadercProcs* = 0;
+
+// ---------------------------------------------------------------- the device's state
+fn VK_FRAMES() -> int32 { return 2; }          // frames in flight
+fn VK_RING() -> int64 { return 16777216; }     // each frame's ring of host-visible memory (bytes)
+fn VK_QUERIES() -> int32 { return 64; }        // timestamps a frame
+fn VK_NTEX() -> int32 { return 4096; }         // T2[]: sampled textures
+fn VK_NSHADOW() -> int32 { return 16; }        // TS[]: depth compared on lookup
+fn VK_NSTOR() -> int32 { return 256; }         // I16[] / I8[]: storage images
+
+// the samplers a texture is seen through
+fn SMP_NEAREST() -> int32 { return 0; }        // clamped, texel for texel (render targets read with texelFetch)
+fn SMP_LINEAR() -> int32 { return 1; }         // clamped, filtered (the glow's chain, the lens)
+fn SMP_REPEAT() -> int32 { return 2; }         // repeating, mipmapped, anisotropic (the meshes' textures)
+fn SMP_CLAMP_MIP() -> int32 { return 3; }      // clamped, mipmapped
+fn SMP_SHADOW() -> int32 { return 4; }         // depth compared on lookup (sampler2DShadow, TS[])
+
+// a buffer: its memory, its address on the GPU, its mapping (host-visible ones)
+struct VkBuf { buf: int64; mem: int64; size: int64; addr: int64; map: uint8*; }
+
+// an image: its view, what it is, where it was last used (its layout, the stage and access that touched it -- the next
+// barrier's source), its bindless indices (0: none -- T2[tex], TS[tex] for a compare sampler; I16[stor] / I8[stor])
+struct VkImg {
+  img: int64; mem: int64; view: int64;
+  fmt: uint32; usage: uint32; aspect: uint32;
+  w: int32; h: int32; mips: int32;
+  layout: uint32; stage: int64; access: int64;
+  smp: int32; tex: int32; stor: int32;
+}
+
+struct VkFrame {
+  cmd: int64; fence: int64; acquired: int64;
+  ring: VkBuf; ring_off: int64;
+  qpool: int64; nq: int32;
+}
+
+struct Vk {
+  dll: int64; instance: int64; messenger: int64; surface: int64; phys: int64; device: int64; queue: int64; qfam: uint32;
+  hwnd: int64; validate: int32; api: uint32;
+  mem: uint8*;                 // VkPhysicalDeviceMemoryProperties
+  props: uint8*;               // VkPhysicalDeviceProperties
+  ts_period: float64;          // ns a timestamp tick
+  aniso: int32;                // samplerAnisotropy is on
+  // the swapchain
+  sc: int64; sc_fmt: uint32; sc_w: int32; sc_h: int32; sc_n: uint32;
+  sc_img: int64[8]; sc_done: int64[8];
+  vsync: int32; sc_dirty: int32;
+  // the frames
+  pool: int64; fr: VkFrame[2]; fi: int32; img_i: uint32; in_frame: int32;
+  once: int64;                 // a command buffer for uploads (submitted and waited on)
+  // bindless
+  dsl: int64; dpool: int64; dset: int64; layout_: int64;
+  smp: int64[5];
+  ntex: int32; nshadow: int32; nstor: int32;
+  tex_img: VkImg**;            // the textures vk_texture_rgba made, by their T2[] index
+  // the frame read back as it's reused: its timestamps (ns), how many
+  ts: int64[64]; ts_n: int32;
+  // the frame's counts (the F7 overlay)
+  n_draws: int64; n_tris: int64; n_verts: int64; n_passes: int64; n_dispatch: int64; n_barriers: int64; ring_bytes: int64;
+}
+var VK: Vk* = 0;
+
+fn vk_stats_reset() {
+  VK->n_draws = 0; VK->n_tris = 0; VK->n_verts = 0; VK->n_passes = 0; VK->n_dispatch = 0; VK->n_barriers = 0; VK->ring_bytes = 0;
+}
+fn vk_count_draw(verts: int64) { VK->n_draws = VK->n_draws + 1; VK->n_verts = VK->n_verts + verts; VK->n_tris = VK->n_tris + verts / 3; }
+
+fn vk_ok(r: int32, what: cstring) -> int32 {
+  if (r == VK_SUCCESS()) { return 1; }
+  print("vulkan: "); print_cstr(what); println(" failed ({r})");
+  return 0;
+}
+
+fn vk_gip(name: cstring) -> int64 {
+  var f: fn(int64, cstring) -> int64 = (fn(int64, cstring) -> int64)vkp->GetInstanceProcAddr;
+  var p: int64 = f(VK->instance, name);
+  if (p == 0) { print("missing Vulkan entry point: "); println_cstr(name); }
+  return p;
+}
+fn vk_gdp(name: cstring) -> int64 {
+  var f: fn(int64, cstring) -> int64 = (fn(int64, cstring) -> int64)vkp->GetDeviceProcAddr;
+  var p: int64 = f(VK->device, name);
+  if (p == 0) { print("missing Vulkan entry point: "); println_cstr(name); }
+  return p;
+}
+
+fn vk_load_instance_procs() {
+  vkp->EnumeratePhysicalDevices = vk_gip("vkEnumeratePhysicalDevices".chars);
+  vkp->GetPhysicalDeviceProperties = vk_gip("vkGetPhysicalDeviceProperties".chars);
+  vkp->GetPhysicalDeviceQueueFamilyProperties = vk_gip("vkGetPhysicalDeviceQueueFamilyProperties".chars);
+  vkp->GetPhysicalDeviceMemoryProperties = vk_gip("vkGetPhysicalDeviceMemoryProperties".chars);
+  vkp->GetPhysicalDeviceFeatures2 = vk_gip("vkGetPhysicalDeviceFeatures2".chars);
+  vkp->GetPhysicalDeviceSurfaceSupportKHR = vk_gip("vkGetPhysicalDeviceSurfaceSupportKHR".chars);
+  vkp->GetPhysicalDeviceSurfaceCapabilitiesKHR = vk_gip("vkGetPhysicalDeviceSurfaceCapabilitiesKHR".chars);
+  vkp->GetPhysicalDeviceSurfaceFormatsKHR = vk_gip("vkGetPhysicalDeviceSurfaceFormatsKHR".chars);
+  vkp->GetPhysicalDeviceSurfacePresentModesKHR = vk_gip("vkGetPhysicalDeviceSurfacePresentModesKHR".chars);
+  vkp->CreateWin32SurfaceKHR = vk_gip("vkCreateWin32SurfaceKHR".chars);
+  vkp->CreateDevice = vk_gip("vkCreateDevice".chars);
+  vkp->GetDeviceProcAddr = vk_gip("vkGetDeviceProcAddr".chars);
+}
+
+fn vk_load_device_procs() -> int32 {
+  vkp->GetDeviceQueue = vk_gdp("vkGetDeviceQueue".chars);
+  vkp->DeviceWaitIdle = vk_gdp("vkDeviceWaitIdle".chars);
+  vkp->CreateSwapchainKHR = vk_gdp("vkCreateSwapchainKHR".chars);
+  vkp->DestroySwapchainKHR = vk_gdp("vkDestroySwapchainKHR".chars);
+  vkp->GetSwapchainImagesKHR = vk_gdp("vkGetSwapchainImagesKHR".chars);
+  vkp->AcquireNextImageKHR = vk_gdp("vkAcquireNextImageKHR".chars);
+  vkp->QueuePresentKHR = vk_gdp("vkQueuePresentKHR".chars);
+  vkp->QueueSubmit = vk_gdp("vkQueueSubmit".chars);
+  vkp->QueueWaitIdle = vk_gdp("vkQueueWaitIdle".chars);
+  vkp->CreateCommandPool = vk_gdp("vkCreateCommandPool".chars);
+  vkp->AllocateCommandBuffers = vk_gdp("vkAllocateCommandBuffers".chars);
+  vkp->BeginCommandBuffer = vk_gdp("vkBeginCommandBuffer".chars);
+  vkp->EndCommandBuffer = vk_gdp("vkEndCommandBuffer".chars);
+  vkp->ResetCommandBuffer = vk_gdp("vkResetCommandBuffer".chars);
+  vkp->CreateFence = vk_gdp("vkCreateFence".chars);
+  vkp->WaitForFences = vk_gdp("vkWaitForFences".chars);
+  vkp->ResetFences = vk_gdp("vkResetFences".chars);
+  vkp->CreateSemaphore = vk_gdp("vkCreateSemaphore".chars);
+  vkp->CreateBuffer = vk_gdp("vkCreateBuffer".chars);
+  vkp->DestroyBuffer = vk_gdp("vkDestroyBuffer".chars);
+  vkp->GetBufferMemoryRequirements = vk_gdp("vkGetBufferMemoryRequirements".chars);
+  vkp->AllocateMemory = vk_gdp("vkAllocateMemory".chars);
+  vkp->FreeMemory = vk_gdp("vkFreeMemory".chars);
+  vkp->BindBufferMemory = vk_gdp("vkBindBufferMemory".chars);
+  vkp->MapMemory = vk_gdp("vkMapMemory".chars);
+  vkp->GetBufferDeviceAddress = vk_gdp("vkGetBufferDeviceAddress".chars);
+  vkp->CreateImage = vk_gdp("vkCreateImage".chars);
+  vkp->DestroyImage = vk_gdp("vkDestroyImage".chars);
+  vkp->GetImageMemoryRequirements = vk_gdp("vkGetImageMemoryRequirements".chars);
+  vkp->BindImageMemory = vk_gdp("vkBindImageMemory".chars);
+  vkp->CreateImageView = vk_gdp("vkCreateImageView".chars);
+  vkp->DestroyImageView = vk_gdp("vkDestroyImageView".chars);
+  vkp->CreateSampler = vk_gdp("vkCreateSampler".chars);
+  vkp->CreateDescriptorSetLayout = vk_gdp("vkCreateDescriptorSetLayout".chars);
+  vkp->CreateDescriptorPool = vk_gdp("vkCreateDescriptorPool".chars);
+  vkp->AllocateDescriptorSets = vk_gdp("vkAllocateDescriptorSets".chars);
+  vkp->UpdateDescriptorSets = vk_gdp("vkUpdateDescriptorSets".chars);
+  vkp->CreateShaderModule = vk_gdp("vkCreateShaderModule".chars);
+  vkp->DestroyShaderModule = vk_gdp("vkDestroyShaderModule".chars);
+  vkp->CreatePipelineLayout = vk_gdp("vkCreatePipelineLayout".chars);
+  vkp->CreateGraphicsPipelines = vk_gdp("vkCreateGraphicsPipelines".chars);
+  vkp->CreateComputePipelines = vk_gdp("vkCreateComputePipelines".chars);
+  vkp->CreateQueryPool = vk_gdp("vkCreateQueryPool".chars);
+  vkp->GetQueryPoolResults = vk_gdp("vkGetQueryPoolResults".chars);
+  vkp->CmdPipelineBarrier2 = vk_gdp("vkCmdPipelineBarrier2".chars);
+  vkp->CmdBeginRendering = vk_gdp("vkCmdBeginRendering".chars);
+  vkp->CmdEndRendering = vk_gdp("vkCmdEndRendering".chars);
+  vkp->CmdBindPipeline = vk_gdp("vkCmdBindPipeline".chars);
+  vkp->CmdBindDescriptorSets = vk_gdp("vkCmdBindDescriptorSets".chars);
+  vkp->CmdPushConstants = vk_gdp("vkCmdPushConstants".chars);
+  vkp->CmdSetViewport = vk_gdp("vkCmdSetViewport".chars);
+  vkp->CmdSetScissor = vk_gdp("vkCmdSetScissor".chars);
+  vkp->CmdSetDepthBias = vk_gdp("vkCmdSetDepthBias".chars);
+  vkp->CmdDraw = vk_gdp("vkCmdDraw".chars);
+  vkp->CmdDrawIndexed = vk_gdp("vkCmdDrawIndexed".chars);
+  vkp->CmdBindIndexBuffer = vk_gdp("vkCmdBindIndexBuffer".chars);
+  vkp->CmdDispatch = vk_gdp("vkCmdDispatch".chars);
+  vkp->CmdCopyBuffer = vk_gdp("vkCmdCopyBuffer".chars);
+  vkp->CmdCopyBufferToImage = vk_gdp("vkCmdCopyBufferToImage".chars);
+  vkp->CmdBlitImage = vk_gdp("vkCmdBlitImage".chars);
+  vkp->CmdWriteTimestamp2 = vk_gdp("vkCmdWriteTimestamp2".chars);
+  vkp->CmdResetQueryPool = vk_gdp("vkCmdResetQueryPool".chars);
+  vkp->CmdClearColorImage = vk_gdp("vkCmdClearColorImage".chars);
+  vkp->CmdCopyImageToBuffer = vk_gdp("vkCmdCopyImageToBuffer".chars);
+  if (vkp->CmdBeginRendering == 0 || vkp->CmdPipelineBarrier2 == 0 || vkp->GetBufferDeviceAddress == 0
+      || vkp->CmdWriteTimestamp2 == 0 || vkp->CreateSwapchainKHR == 0) {
+    return 0;
+  }
+  return 1;
+}
+
+// ---------------------------------------------------------------- typed calls
+fn vkCreateInstance(ci: VkInstanceCreateInfo*, out: int64*) -> int32 { var f: fn(VkInstanceCreateInfo*, uint8*, int64*) -> int32 = (fn(VkInstanceCreateInfo*, uint8*, int64*) -> int32)vkp->CreateInstance; return f(ci, (uint8*)0, out); }
+fn vkEnumeratePhysicalDevices(n: uint32*, out: int64*) -> int32 { var f: fn(int64, uint32*, int64*) -> int32 = (fn(int64, uint32*, int64*) -> int32)vkp->EnumeratePhysicalDevices; return f(VK->instance, n, out); }
+fn vkGetPhysicalDeviceProperties(pd: int64, out: uint8*) { var f: fn(int64, uint8*) -> void = (fn(int64, uint8*) -> void)vkp->GetPhysicalDeviceProperties; f(pd, out); }
+fn vkGetPhysicalDeviceQueueFamilyProperties(pd: int64, n: uint32*, out: uint8*) { var f: fn(int64, uint32*, uint8*) -> void = (fn(int64, uint32*, uint8*) -> void)vkp->GetPhysicalDeviceQueueFamilyProperties; f(pd, n, out); }
+fn vkGetPhysicalDeviceMemoryProperties(pd: int64, out: uint8*) { var f: fn(int64, uint8*) -> void = (fn(int64, uint8*) -> void)vkp->GetPhysicalDeviceMemoryProperties; f(pd, out); }
+fn vkGetPhysicalDeviceFeatures2(pd: int64, out: VkFeatures2*) { var f: fn(int64, VkFeatures2*) -> void = (fn(int64, VkFeatures2*) -> void)vkp->GetPhysicalDeviceFeatures2; f(pd, out); }
+fn vkGetPhysicalDeviceSurfaceSupportKHR(pd: int64, qf: uint32, out: uint32*) -> int32 { var f: fn(int64, uint32, int64, uint32*) -> int32 = (fn(int64, uint32, int64, uint32*) -> int32)vkp->GetPhysicalDeviceSurfaceSupportKHR; return f(pd, qf, VK->surface, out); }
+fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(out: uint32*) -> int32 { var f: fn(int64, int64, uint32*) -> int32 = (fn(int64, int64, uint32*) -> int32)vkp->GetPhysicalDeviceSurfaceCapabilitiesKHR; return f(VK->phys, VK->surface, out); }
+fn vkGetPhysicalDeviceSurfaceFormatsKHR(n: uint32*, out: uint32*) -> int32 { var f: fn(int64, int64, uint32*, uint32*) -> int32 = (fn(int64, int64, uint32*, uint32*) -> int32)vkp->GetPhysicalDeviceSurfaceFormatsKHR; return f(VK->phys, VK->surface, n, out); }
+fn vkGetPhysicalDeviceSurfacePresentModesKHR(n: uint32*, out: uint32*) -> int32 { var f: fn(int64, int64, uint32*, uint32*) -> int32 = (fn(int64, int64, uint32*, uint32*) -> int32)vkp->GetPhysicalDeviceSurfacePresentModesKHR; return f(VK->phys, VK->surface, n, out); }
+fn vkCreateWin32SurfaceKHR(ci: VkWin32SurfaceCreateInfoKHR*, out: int64*) -> int32 { var f: fn(int64, VkWin32SurfaceCreateInfoKHR*, uint8*, int64*) -> int32 = (fn(int64, VkWin32SurfaceCreateInfoKHR*, uint8*, int64*) -> int32)vkp->CreateWin32SurfaceKHR; return f(VK->instance, ci, (uint8*)0, out); }
+fn vkCreateDebugUtilsMessengerEXT(ci: VkDebugUtilsMessengerCreateInfoEXT*, out: int64*) -> int32 { var f: fn(int64, VkDebugUtilsMessengerCreateInfoEXT*, uint8*, int64*) -> int32 = (fn(int64, VkDebugUtilsMessengerCreateInfoEXT*, uint8*, int64*) -> int32)vkp->CreateDebugUtilsMessengerEXT; return f(VK->instance, ci, (uint8*)0, out); }
+fn vkCreateDevice(ci: VkDeviceCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkDeviceCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkDeviceCreateInfo*, uint8*, int64*) -> int32)vkp->CreateDevice; return f(VK->phys, ci, (uint8*)0, out); }
+fn vkGetDeviceQueue(qf: uint32, out: int64*) { var f: fn(int64, uint32, uint32, int64*) -> void = (fn(int64, uint32, uint32, int64*) -> void)vkp->GetDeviceQueue; f(VK->device, qf, (uint32)0, out); }
+fn vkDeviceWaitIdle() -> int32 { var f: fn(int64) -> int32 = (fn(int64) -> int32)vkp->DeviceWaitIdle; return f(VK->device); }
+fn vkCreateSwapchainKHR(ci: VkSwapchainCreateInfoKHR*, out: int64*) -> int32 { var f: fn(int64, VkSwapchainCreateInfoKHR*, uint8*, int64*) -> int32 = (fn(int64, VkSwapchainCreateInfoKHR*, uint8*, int64*) -> int32)vkp->CreateSwapchainKHR; return f(VK->device, ci, (uint8*)0, out); }
+fn vkDestroySwapchainKHR(sc: int64) { var f: fn(int64, int64, uint8*) -> void = (fn(int64, int64, uint8*) -> void)vkp->DestroySwapchainKHR; f(VK->device, sc, (uint8*)0); }
+fn vkGetSwapchainImagesKHR(n: uint32*, out: int64*) -> int32 { var f: fn(int64, int64, uint32*, int64*) -> int32 = (fn(int64, int64, uint32*, int64*) -> int32)vkp->GetSwapchainImagesKHR; return f(VK->device, VK->sc, n, out); }
+fn vkAcquireNextImageKHR(sem: int64, idx: uint32*) -> int32 { var f: fn(int64, int64, int64, int64, int64, uint32*) -> int32 = (fn(int64, int64, int64, int64, int64, uint32*) -> int32)vkp->AcquireNextImageKHR; return f(VK->device, VK->sc, -1, sem, 0, idx); }
+fn vkQueuePresentKHR(info: VkPresentInfoKHR*) -> int32 { var f: fn(int64, VkPresentInfoKHR*) -> int32 = (fn(int64, VkPresentInfoKHR*) -> int32)vkp->QueuePresentKHR; return f(VK->queue, info); }
+fn vkQueueSubmit(info: VkSubmitInfo*, fence: int64) -> int32 { var f: fn(int64, uint32, VkSubmitInfo*, int64) -> int32 = (fn(int64, uint32, VkSubmitInfo*, int64) -> int32)vkp->QueueSubmit; return f(VK->queue, (uint32)1, info, fence); }
+fn vkQueueWaitIdle() -> int32 { var f: fn(int64) -> int32 = (fn(int64) -> int32)vkp->QueueWaitIdle; return f(VK->queue); }
+fn vkCreateCommandPool(ci: VkCommandPoolCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkCommandPoolCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkCommandPoolCreateInfo*, uint8*, int64*) -> int32)vkp->CreateCommandPool; return f(VK->device, ci, (uint8*)0, out); }
+fn vkAllocateCommandBuffers(ai: VkCommandBufferAllocateInfo*, out: int64*) -> int32 { var f: fn(int64, VkCommandBufferAllocateInfo*, int64*) -> int32 = (fn(int64, VkCommandBufferAllocateInfo*, int64*) -> int32)vkp->AllocateCommandBuffers; return f(VK->device, ai, out); }
+fn vkBeginCommandBuffer(cb: int64, bi: VkCommandBufferBeginInfo*) -> int32 { var f: fn(int64, VkCommandBufferBeginInfo*) -> int32 = (fn(int64, VkCommandBufferBeginInfo*) -> int32)vkp->BeginCommandBuffer; return f(cb, bi); }
+fn vkEndCommandBuffer(cb: int64) -> int32 { var f: fn(int64) -> int32 = (fn(int64) -> int32)vkp->EndCommandBuffer; return f(cb); }
+fn vkResetCommandBuffer(cb: int64) -> int32 { var f: fn(int64, uint32) -> int32 = (fn(int64, uint32) -> int32)vkp->ResetCommandBuffer; return f(cb, (uint32)0); }
+fn vkCreateFence(ci: VkFenceCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkFenceCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkFenceCreateInfo*, uint8*, int64*) -> int32)vkp->CreateFence; return f(VK->device, ci, (uint8*)0, out); }
+fn vkWaitForFence(fence: int64*) -> int32 { var f: fn(int64, uint32, int64*, uint32, int64) -> int32 = (fn(int64, uint32, int64*, uint32, int64) -> int32)vkp->WaitForFences; return f(VK->device, (uint32)1, fence, (uint32)1, -1); }
+fn vkResetFence(fence: int64*) -> int32 { var f: fn(int64, uint32, int64*) -> int32 = (fn(int64, uint32, int64*) -> int32)vkp->ResetFences; return f(VK->device, (uint32)1, fence); }
+fn vkCreateSemaphore(ci: VkSemaphoreCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkSemaphoreCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkSemaphoreCreateInfo*, uint8*, int64*) -> int32)vkp->CreateSemaphore; return f(VK->device, ci, (uint8*)0, out); }
+fn vkCreateBuffer(ci: VkBufferCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkBufferCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkBufferCreateInfo*, uint8*, int64*) -> int32)vkp->CreateBuffer; return f(VK->device, ci, (uint8*)0, out); }
+fn vkDestroyBuffer(b: int64) { var f: fn(int64, int64, uint8*) -> void = (fn(int64, int64, uint8*) -> void)vkp->DestroyBuffer; f(VK->device, b, (uint8*)0); }
+fn vkGetBufferMemoryRequirements(b: int64, out: VkMemoryRequirements*) { var f: fn(int64, int64, VkMemoryRequirements*) -> void = (fn(int64, int64, VkMemoryRequirements*) -> void)vkp->GetBufferMemoryRequirements; f(VK->device, b, out); }
+fn vkAllocateMemory(ai: VkMemoryAllocateInfo*, out: int64*) -> int32 { var f: fn(int64, VkMemoryAllocateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkMemoryAllocateInfo*, uint8*, int64*) -> int32)vkp->AllocateMemory; return f(VK->device, ai, (uint8*)0, out); }
+fn vkFreeMemory(m: int64) { var f: fn(int64, int64, uint8*) -> void = (fn(int64, int64, uint8*) -> void)vkp->FreeMemory; f(VK->device, m, (uint8*)0); }
+fn vkBindBufferMemory(b: int64, m: int64) -> int32 { var f: fn(int64, int64, int64, int64) -> int32 = (fn(int64, int64, int64, int64) -> int32)vkp->BindBufferMemory; return f(VK->device, b, m, 0); }
+fn vkMapMemory(m: int64, out: uint8**) -> int32 { var f: fn(int64, int64, int64, int64, uint32, uint8**) -> int32 = (fn(int64, int64, int64, int64, uint32, uint8**) -> int32)vkp->MapMemory; return f(VK->device, m, 0, -1, (uint32)0, out); }
+fn vkGetBufferDeviceAddress(b: int64) -> int64 { var f: fn(int64, VkBufferDeviceAddressInfo*) -> int64 = (fn(int64, VkBufferDeviceAddressInfo*) -> int64)vkp->GetBufferDeviceAddress; var i: VkBufferDeviceAddressInfo; i.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO(); i.buffer = b; return f(VK->device, &i); }
+fn vkCreateImage(ci: VkImageCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkImageCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkImageCreateInfo*, uint8*, int64*) -> int32)vkp->CreateImage; return f(VK->device, ci, (uint8*)0, out); }
+fn vkDestroyImage(i: int64) { var f: fn(int64, int64, uint8*) -> void = (fn(int64, int64, uint8*) -> void)vkp->DestroyImage; f(VK->device, i, (uint8*)0); }
+fn vkGetImageMemoryRequirements(i: int64, out: VkMemoryRequirements*) { var f: fn(int64, int64, VkMemoryRequirements*) -> void = (fn(int64, int64, VkMemoryRequirements*) -> void)vkp->GetImageMemoryRequirements; f(VK->device, i, out); }
+fn vkBindImageMemory(i: int64, m: int64) -> int32 { var f: fn(int64, int64, int64, int64) -> int32 = (fn(int64, int64, int64, int64) -> int32)vkp->BindImageMemory; return f(VK->device, i, m, 0); }
+fn vkCreateImageView(ci: VkImageViewCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkImageViewCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkImageViewCreateInfo*, uint8*, int64*) -> int32)vkp->CreateImageView; return f(VK->device, ci, (uint8*)0, out); }
+fn vkDestroyImageView(v: int64) { var f: fn(int64, int64, uint8*) -> void = (fn(int64, int64, uint8*) -> void)vkp->DestroyImageView; f(VK->device, v, (uint8*)0); }
+fn vkCreateSampler(ci: VkSamplerCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkSamplerCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkSamplerCreateInfo*, uint8*, int64*) -> int32)vkp->CreateSampler; return f(VK->device, ci, (uint8*)0, out); }
+fn vkCreateDescriptorSetLayout(ci: VkDescriptorSetLayoutCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkDescriptorSetLayoutCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkDescriptorSetLayoutCreateInfo*, uint8*, int64*) -> int32)vkp->CreateDescriptorSetLayout; return f(VK->device, ci, (uint8*)0, out); }
+fn vkCreateDescriptorPool(ci: VkDescriptorPoolCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkDescriptorPoolCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkDescriptorPoolCreateInfo*, uint8*, int64*) -> int32)vkp->CreateDescriptorPool; return f(VK->device, ci, (uint8*)0, out); }
+fn vkAllocateDescriptorSets(ai: VkDescriptorSetAllocateInfo*, out: int64*) -> int32 { var f: fn(int64, VkDescriptorSetAllocateInfo*, int64*) -> int32 = (fn(int64, VkDescriptorSetAllocateInfo*, int64*) -> int32)vkp->AllocateDescriptorSets; return f(VK->device, ai, out); }
+fn vkUpdateDescriptorSet(w: VkWriteDescriptorSet*) { var f: fn(int64, uint32, VkWriteDescriptorSet*, uint32, uint8*) -> void = (fn(int64, uint32, VkWriteDescriptorSet*, uint32, uint8*) -> void)vkp->UpdateDescriptorSets; f(VK->device, (uint32)1, w, (uint32)0, (uint8*)0); }
+fn vkCreateShaderModule(ci: VkShaderModuleCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkShaderModuleCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkShaderModuleCreateInfo*, uint8*, int64*) -> int32)vkp->CreateShaderModule; return f(VK->device, ci, (uint8*)0, out); }
+fn vkDestroyShaderModule(m: int64) { var f: fn(int64, int64, uint8*) -> void = (fn(int64, int64, uint8*) -> void)vkp->DestroyShaderModule; f(VK->device, m, (uint8*)0); }
+fn vkCreatePipelineLayout(ci: VkPipelineLayoutCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkPipelineLayoutCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkPipelineLayoutCreateInfo*, uint8*, int64*) -> int32)vkp->CreatePipelineLayout; return f(VK->device, ci, (uint8*)0, out); }
+fn vkCreateGraphicsPipeline(ci: VkGraphicsPipelineCreateInfo*, out: int64*) -> int32 { var f: fn(int64, int64, uint32, VkGraphicsPipelineCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, int64, uint32, VkGraphicsPipelineCreateInfo*, uint8*, int64*) -> int32)vkp->CreateGraphicsPipelines; return f(VK->device, 0, (uint32)1, ci, (uint8*)0, out); }
+fn vkCreateComputePipeline(ci: VkComputePipelineCreateInfo*, out: int64*) -> int32 { var f: fn(int64, int64, uint32, VkComputePipelineCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, int64, uint32, VkComputePipelineCreateInfo*, uint8*, int64*) -> int32)vkp->CreateComputePipelines; return f(VK->device, 0, (uint32)1, ci, (uint8*)0, out); }
+fn vkCreateQueryPool(ci: VkQueryPoolCreateInfo*, out: int64*) -> int32 { var f: fn(int64, VkQueryPoolCreateInfo*, uint8*, int64*) -> int32 = (fn(int64, VkQueryPoolCreateInfo*, uint8*, int64*) -> int32)vkp->CreateQueryPool; return f(VK->device, ci, (uint8*)0, out); }
+fn vkGetQueryPoolResults(pool: int64, n: uint32, out: int64*) -> int32 { var f: fn(int64, int64, uint32, uint32, int64, uint8*, int64, uint32) -> int32 = (fn(int64, int64, uint32, uint32, int64, uint8*, int64, uint32) -> int32)vkp->GetQueryPoolResults; return f(VK->device, pool, (uint32)0, n, (int64)n * 8, (uint8*)out, 8, VK_QUERY_RESULT_64_BIT()); }
+
+fn vkCmdPipelineBarrier2(cb: int64, dep: VkDependencyInfo*) { var f: fn(int64, VkDependencyInfo*) -> void = (fn(int64, VkDependencyInfo*) -> void)vkp->CmdPipelineBarrier2; VK->n_barriers = VK->n_barriers + 1; f(cb, dep); }
+fn vkCmdBeginRendering(cb: int64, ri: VkRenderingInfo*) { var f: fn(int64, VkRenderingInfo*) -> void = (fn(int64, VkRenderingInfo*) -> void)vkp->CmdBeginRendering; f(cb, ri); }
+fn vkCmdEndRendering(cb: int64) { var f: fn(int64) -> void = (fn(int64) -> void)vkp->CmdEndRendering; f(cb); }
+fn vkCmdBindPipeline(cb: int64, bp: uint32, p: int64) { var f: fn(int64, uint32, int64) -> void = (fn(int64, uint32, int64) -> void)vkp->CmdBindPipeline; f(cb, bp, p); }
+fn vkCmdBindDescriptorSet(cb: int64, bp: uint32) { var f: fn(int64, uint32, int64, uint32, uint32, int64*, uint32, uint32*) -> void = (fn(int64, uint32, int64, uint32, uint32, int64*, uint32, uint32*) -> void)vkp->CmdBindDescriptorSets; f(cb, bp, VK->layout_, (uint32)0, (uint32)1, &VK->dset, (uint32)0, (uint32*)0); }
+fn vkCmdPushConstants(cb: int64, data: uint8*, size: uint32) { var f: fn(int64, int64, uint32, uint32, uint32, uint8*) -> void = (fn(int64, int64, uint32, uint32, uint32, uint8*) -> void)vkp->CmdPushConstants; f(cb, VK->layout_, VK_SHADER_STAGE_ALL(), (uint32)0, size, data); }
+fn vkCmdSetViewport(cb: int64, vp: VkViewport*) { var f: fn(int64, uint32, uint32, VkViewport*) -> void = (fn(int64, uint32, uint32, VkViewport*) -> void)vkp->CmdSetViewport; f(cb, (uint32)0, (uint32)1, vp); }
+fn vkCmdSetScissor(cb: int64, r: VkRect2D*) { var f: fn(int64, uint32, uint32, VkRect2D*) -> void = (fn(int64, uint32, uint32, VkRect2D*) -> void)vkp->CmdSetScissor; f(cb, (uint32)0, (uint32)1, r); }
+fn vkCmdSetDepthBias(cb: int64, c: float32, clamp: float32, slope: float32) { var f: fn(int64, float32, float32, float32) -> void = (fn(int64, float32, float32, float32) -> void)vkp->CmdSetDepthBias; f(cb, c, clamp, slope); }
+fn vkCmdDraw(cb: int64, n: uint32, first: uint32) { var f: fn(int64, uint32, uint32, uint32, uint32) -> void = (fn(int64, uint32, uint32, uint32, uint32) -> void)vkp->CmdDraw; f(cb, n, (uint32)1, first, (uint32)0); }
+fn vkCmdDrawIndexed(cb: int64, n: uint32, first: uint32) { var f: fn(int64, uint32, uint32, uint32, int32, uint32) -> void = (fn(int64, uint32, uint32, uint32, int32, uint32) -> void)vkp->CmdDrawIndexed; f(cb, n, (uint32)1, first, 0, (uint32)0); }
+fn vkCmdBindIndexBuffer(cb: int64, b: int64) { var f: fn(int64, int64, int64, uint32) -> void = (fn(int64, int64, int64, uint32) -> void)vkp->CmdBindIndexBuffer; f(cb, b, 0, VK_INDEX_TYPE_UINT32()); }
+fn vkCmdDispatch(cb: int64, x: uint32, y: uint32) { var f: fn(int64, uint32, uint32, uint32) -> void = (fn(int64, uint32, uint32, uint32) -> void)vkp->CmdDispatch; f(cb, x, y, (uint32)1); }
+fn vkCmdCopyBuffer(cb: int64, src: int64, dst: int64, bytes: int64) { var f: fn(int64, int64, int64, uint32, int64*) -> void = (fn(int64, int64, int64, uint32, int64*) -> void)vkp->CmdCopyBuffer; var r: int64[3]; r[0] = 0; r[1] = 0; r[2] = bytes; f(cb, src, dst, (uint32)1, &r[0]); }
+fn vkCmdCopyBufferToImage(cb: int64, buf: int64, img: int64, r: VkBufferImageCopy*) { var f: fn(int64, int64, int64, uint32, uint32, VkBufferImageCopy*) -> void = (fn(int64, int64, int64, uint32, uint32, VkBufferImageCopy*) -> void)vkp->CmdCopyBufferToImage; f(cb, buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(), (uint32)1, r); }
+fn vkCmdBlitImage(cb: int64, src: int64, dst: int64, r: VkImageBlit*, filter: uint32) { var f: fn(int64, int64, uint32, int64, uint32, uint32, VkImageBlit*, uint32) -> void = (fn(int64, int64, uint32, int64, uint32, uint32, VkImageBlit*, uint32) -> void)vkp->CmdBlitImage; f(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL(), dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(), (uint32)1, r, filter); }
+fn vkCmdWriteTimestamp2(cb: int64, pool: int64, q: uint32) { var f: fn(int64, int64, int64, uint32) -> void = (fn(int64, int64, int64, uint32) -> void)vkp->CmdWriteTimestamp2; f(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT(), pool, q); }
+fn vkCmdResetQueryPool(cb: int64, pool: int64, n: uint32) { var f: fn(int64, int64, uint32, uint32) -> void = (fn(int64, int64, uint32, uint32) -> void)vkp->CmdResetQueryPool; f(cb, pool, (uint32)0, n); }
+
+// ---------------------------------------------------------------- strings (a shader's source composed from pieces)
+fn vk_strlen(s: cstring) -> int64 {
+  var n: int64 = 0;
+  while (s[n] != (uint8)0) { n = n + 1; }
+  return n;
+}
+
+// a string of two (a game's extension made of a library and its own; a shader after the prelude)
+fn str_join(a: cstring, b: cstring) -> cstring {
+  var n: int64 = vk_strlen(a);
+  var m: int64 = vk_strlen(b);
+  var out: uint8* = (uint8*)malloc(n + m + 1);
+  memcpy((rawptr)out, (rawptr)a, n);
+  memcpy((rawptr)(out + n), (rawptr)b, m);
+  out[n + m] = (uint8)0;
+  return (cstring)out;
+}
+fn str_join3(a: cstring, b: cstring, c: cstring) -> cstring { return str_join(str_join(a, b), c); }
+
+// a shader's source with its "#pragma ext" line (alone on it) replaced by ext: the engine's shaders take a game's
+// extensions there. The source as it is when it has none
+fn glsl_splice(src: cstring, ext: cstring) -> cstring {
+  var n: int64 = vk_strlen(src);
+  var m: int64 = vk_strlen(ext);
+  var mark: cstring = "
+#pragma ext
+".chars;
+  var at: int64 = -1;
+  var i: int64 = 0;
+  while (i + 13 <= n && at < 0) {
+    var k: int64 = 0;
+    while (k < 13 && src[i + k] == mark[k]) { k = k + 1; }
+    if (k == 13) { at = i; }
+    i = i + 1;
+  }
+  if (at < 0) { return src; }
+  var out: uint8* = (uint8*)malloc(n + m + 2);
+  i = 0;
+  while (i <= at) { out[i] = src[i]; i = i + 1; }               // (through the newline before the mark)
+  var j: int64 = 0;
+  while (j < m) { out[at + 1 + j] = ext[j]; j = j + 1; }
+  var o: int64 = at + 1 + m;
+  out[o] = (uint8)10; o = o + 1;
+  i = at + 13;
+  while (i < n) { out[o] = src[i]; o = o + 1; i = i + 1; }
+  out[o] = (uint8)0;
+  return (cstring)out;
+}
+
+// ---------------------------------------------------------------- shaders: GLSL -> SPIR-V (shaderc) -> a module
+fn SHK_VERTEX() -> int32 { return 0; }
+fn SHK_FRAGMENT() -> int32 { return 1; }
+fn SHK_COMPUTE() -> int32 { return 2; }
+
+fn shc_proc(dll: int64, name: cstring) -> int64 {
+  var p: int64 = Vk_GetProcAddress(dll, name);
+  if (p == 0) { print("missing shaderc entry point: "); println_cstr(name); }
+  return p;
+}
+fn shaderc_load() -> int32 {
+  var dll: int64 = Vk_LoadLibraryA("shaderc_shared.dll".chars);
+  if (dll == 0) {
+    println("shaderc_shared.dll not found: put it beside the exe (the Vulkan SDK's Bin has it) or on PATH");
+    return 0;
+  }
+  shc = new ShadercProcs;
+  shc->init = shc_proc(dll, "shaderc_compiler_initialize".chars);
+  shc->opts_init = shc_proc(dll, "shaderc_compile_options_initialize".chars);
+  shc->set_env = shc_proc(dll, "shaderc_compile_options_set_target_env".chars);
+  shc->set_opt = shc_proc(dll, "shaderc_compile_options_set_optimization_level".chars);
+  shc->compile = shc_proc(dll, "shaderc_compile_into_spv".chars);
+  shc->status = shc_proc(dll, "shaderc_result_get_compilation_status".chars);
+  shc->length = shc_proc(dll, "shaderc_result_get_length".chars);
+  shc->bytes = shc_proc(dll, "shaderc_result_get_bytes".chars);
+  shc->err = shc_proc(dll, "shaderc_result_get_error_message".chars);
+  shc->release = shc_proc(dll, "shaderc_result_release".chars);
+  if (shc->init == 0 || shc->compile == 0 || shc->release == 0) { return 0; }
+  var init: fn() -> int64 = (fn() -> int64)shc->init;
+  shc->compiler = init();
+  var oi: fn() -> int64 = (fn() -> int64)shc->opts_init;
+  shc->opts = oi();
+  var se: fn(int64, int32, uint32) -> void = (fn(int64, int32, uint32) -> void)shc->set_env;
+  se(shc->opts, 0, VK_API_VERSION_1_3());                        // (shaderc_target_env_vulkan; SPIR-V 1.6)
+  var so: fn(int64, int32) -> void = (fn(int64, int32) -> void)shc->set_opt;
+  so(shc->opts, 2);                                              // (shaderc_optimization_level_performance)
+  return 1;
+}
+
+// GLSL (kind: SHK_*) compiled into a shader module; 0 when it doesn't compile (the log printed, with `what`)
+fn vk_glsl(kind: int32, src: cstring, what: cstring) -> int64 {
+  var comp: fn(int64, cstring, int64, int32, cstring, cstring, int64) -> int64 =
+    (fn(int64, cstring, int64, int32, cstring, cstring, int64) -> int64)shc->compile;
+  var res: int64 = comp(shc->compiler, src, vk_strlen(src), kind, what, "main".chars, shc->opts);
+  var st: fn(int64) -> int32 = (fn(int64) -> int32)shc->status;
+  var rel: fn(int64) -> void = (fn(int64) -> void)shc->release;
+  if (st(res) != 0) {
+    var em: fn(int64) -> cstring = (fn(int64) -> cstring)shc->err;
+    print("shader compile failed: "); println_cstr(what);
+    println_cstr(em(res));
+    rel(res);
+    return 0;
+  }
+  var ln: fn(int64) -> int64 = (fn(int64) -> int64)shc->length;
+  var by: fn(int64) -> uint8* = (fn(int64) -> uint8*)shc->bytes;
+  var ci: VkShaderModuleCreateInfo;
+  ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO();
+  ci.codeSize = ln(res);
+  ci.pCode = by(res);
+  var m: int64 = 0;
+  var r: int32 = vkCreateShaderModule(&ci, &m);
+  rel(res);
+  if (vk_ok(r, what) == 0) { return 0; }
+  return m;
+}
+
+// ---------------------------------------------------------------- memory
+fn vk_mem_type(bits: uint32, want: uint32) -> uint32 {
+  var n: uint32 = *(uint32*)VK->mem;
+  var i: uint32 = (uint32)0;
+  while (i < n) {
+    var flags: uint32 = *(uint32*)(VK->mem + 4 + (int64)i * 8);
+    if ((bits & ((uint32)1 << i)) != (uint32)0 && (flags & want) == want) { return i; }
+    i = i + (uint32)1;
+  }
+  return (uint32)0xFFFFFFFF;
+}
+
+fn vk_alloc(req: VkMemoryRequirements*, want: uint32, device_address: int32) -> int64 {
+  var t: uint32 = vk_mem_type(req->memoryTypeBits, want);
+  if (t == (uint32)0xFFFFFFFF) { println("vulkan: no memory type fits"); return 0; }
+  var fl: VkMemoryAllocateFlagsInfo;
+  fl.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO();
+  fl.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT();
+  var ai: VkMemoryAllocateInfo;
+  ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO();
+  if (device_address != 0) { ai.pNext = (uint8*)&fl; }
+  ai.allocationSize = req->size;
+  ai.memoryTypeIndex = t;
+  var m: int64 = 0;
+  if (vk_ok(vkAllocateMemory(&ai, &m), "vkAllocateMemory".chars) == 0) { return 0; }
+  return m;
+}
+
+// a buffer of `bytes` (usage: VK_BUFFER_USAGE_*; its device address always available); host: mapped, else device-local
+fn vk_buf_make(B: VkBuf*, bytes: int64, usage: uint32, host: int32) -> int32 {
+  var ci: VkBufferCreateInfo;
+  ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO();
+  ci.size = bytes;
+  ci.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT();
+  ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE();
+  if (vk_ok(vkCreateBuffer(&ci, &B->buf), "vkCreateBuffer".chars) == 0) { return 0; }
+  var req: VkMemoryRequirements;
+  vkGetBufferMemoryRequirements(B->buf, &req);
+  var want: uint32 = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT();
+  if (host != 0) { want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT() | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT(); }
+  B->mem = vk_alloc(&req, want, 1);
+  if (B->mem == 0) { return 0; }
+  vkBindBufferMemory(B->buf, B->mem);
+  B->size = bytes;
+  B->addr = vkGetBufferDeviceAddress(B->buf);
+  if (host != 0) { vkMapMemory(B->mem, &B->map); }
+  return 1;
+}
+
+// a device-local buffer holding `bytes` of data (copied through a staging buffer, waited on)
+fn vk_buf_upload(B: VkBuf*, data: uint8*, bytes: int64, usage: uint32) -> int32 {
+  if (vk_buf_make(B, bytes, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT(), 0) == 0) { return 0; }
+  var S: VkBuf;
+  if (vk_buf_make(&S, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT(), 1) == 0) { return 0; }
+  memcpy((rawptr)S.map, (rawptr)data, bytes);
+  var cb: int64 = vk_once_begin();
+  vkCmdCopyBuffer(cb, S.buf, B->buf, bytes);
+  vk_once_end();
+  vkDestroyBuffer(S.buf);
+  vkFreeMemory(S.mem);
+  return 1;
+}
+
+// this frame's ring: `bytes` of host-visible memory (256-aligned) for the GPU to read this frame -> its address; *out
+// where to write it
+fn vk_ring(bytes: int64, out: uint8**) -> int64 {
+  var F: VkFrame* = &VK->fr[VK->fi];
+  var off: int64 = (F->ring_off + 255) & ~255;
+  if (off + bytes > F->ring.size) {
+    println("vulkan: the frame's ring is full");
+    off = 0;
+  }
+  F->ring_off = off + bytes;
+  VK->ring_bytes = F->ring_off;
+  *out = F->ring.map + off;
+  return F->ring.addr + off;
+}
+
+// ---------------------------------------------------------------- one-off commands (uploads), waited on
+fn vk_once_begin() -> int64 {
+  vkResetCommandBuffer(VK->once);
+  var bi: VkCommandBufferBeginInfo;
+  bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO();
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT();
+  vkBeginCommandBuffer(VK->once, &bi);
+  return VK->once;
+}
+fn vk_once_end() {
+  vkEndCommandBuffer(VK->once);
+  var si: VkSubmitInfo;
+  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO();
+  si.commandBufferCount = (uint32)1;
+  si.pCommandBuffers = &VK->once;
+  vkQueueSubmit(&si, 0);
+  vkQueueWaitIdle();
+}
+
+// ---------------------------------------------------------------- barriers
+fn vk_is_write(a: int64) -> int32 {
+  var w: int64 = VK_ACCESS_2_SHADER_WRITE_BIT() | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT()
+    | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT() | VK_ACCESS_2_TRANSFER_WRITE_BIT() | VK_ACCESS_2_MEMORY_WRITE_BIT()
+    | VK_ACCESS_2_HOST_WRITE_BIT() | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT();
+  if ((a & w) != 0) { return 1; }
+  return 0;
+}
+
+// an image's mips [mip, mip + n) from one layout to another, after (stage, access) and before (stage2, access2)
+fn vk_barrier_raw(cb: int64, img: int64, aspect: uint32, mip: int32, n: int32, old: uint32, nw: uint32,
+                  s1: int64, a1: int64, s2: int64, a2: int64) {
+  var b: VkImageMemoryBarrier2;
+  b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2();
+  b.srcStageMask = s1; b.srcAccessMask = a1;
+  b.dstStageMask = s2; b.dstAccessMask = a2;
+  b.oldLayout = old; b.newLayout = nw;
+  b.srcQueueFamilyIndex = (uint32)0xFFFFFFFF; b.dstQueueFamilyIndex = (uint32)0xFFFFFFFF;
+  b.image = img;
+  b.aspectMask = aspect;
+  b.baseMipLevel = (uint32)mip; b.levelCount = (uint32)n;
+  b.layerCount = (uint32)1;
+  var d: VkDependencyInfo;
+  d.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO();
+  d.imageMemoryBarrierCount = (uint32)1;
+  d.pImageMemoryBarriers = &b;
+  vkCmdPipelineBarrier2(cb, &d);
+}
+
+// the image made ready for its next use: layout, and the stage and access that will touch it (nothing done when it's
+// already there and neither use writes)
+fn vk_use(I: VkImg*, layout: uint32, stage: int64, access: int64) {
+  if (I->layout == layout && vk_is_write(I->access) == 0 && vk_is_write(access) == 0) {
+    I->stage = I->stage | stage;
+    I->access = I->access | access;
+    return;
+  }
+  vk_barrier_raw(vk_cmd(), I->img, I->aspect, 0, I->mips, I->layout, layout, I->stage, I->access, stage, access);
+  I->layout = layout; I->stage = stage; I->access = access;
+}
+// the usual uses: read by a fragment / compute shader; written by a compute shader; drawn into
+fn vk_read_fs(I: VkImg*) { vk_use(I, VK_IMAGE_LAYOUT_GENERAL(), VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT(), VK_ACCESS_2_SHADER_SAMPLED_READ_BIT()); }
+fn vk_read_cs(I: VkImg*) { vk_use(I, VK_IMAGE_LAYOUT_GENERAL(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT(), VK_ACCESS_2_SHADER_SAMPLED_READ_BIT() | VK_ACCESS_2_SHADER_STORAGE_READ_BIT()); }
+fn vk_write_cs(I: VkImg*) { vk_use(I, VK_IMAGE_LAYOUT_GENERAL(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT(), VK_ACCESS_2_SHADER_STORAGE_READ_BIT() | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT()); }
+
+// ---------------------------------------------------------------- images and the bindless arrays
+fn vk_desc_image(binding: uint32, index: int32, typ: uint32, smp: int64, view: int64, layout: uint32) {
+  var ii: VkDescriptorImageInfo;
+  ii.sampler = smp; ii.imageView = view; ii.imageLayout = layout;
+  var w: VkWriteDescriptorSet;
+  w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET();
+  w.dstSet = VK->dset;
+  w.dstBinding = binding;
+  w.dstArrayElement = (uint32)index;
+  w.descriptorCount = (uint32)1;
+  w.descriptorType = typ;
+  w.pImageInfo = &ii;
+  vkUpdateDescriptorSet(&w);
+}
+
+// its bindless entries (indices kept across a remake, so what holds them needn't change)
+fn vk_img_register(I: VkImg*, desc_layout: uint32) {
+  if ((I->usage & VK_IMAGE_USAGE_SAMPLED_BIT()) != (uint32)0) {
+    if (I->smp == SMP_SHADOW()) {
+      if (I->tex == 0) { VK->nshadow = VK->nshadow + 1; I->tex = VK->nshadow; }
+      vk_desc_image((uint32)1, I->tex, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER(), VK->smp[I->smp], I->view, desc_layout);
+    } else {
+      if (I->tex == 0) { VK->ntex = VK->ntex + 1; I->tex = VK->ntex; }
+      vk_desc_image((uint32)0, I->tex, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER(), VK->smp[I->smp], I->view, desc_layout);
+    }
+  }
+  if ((I->usage & VK_IMAGE_USAGE_STORAGE_BIT()) != (uint32)0) {
+    if (I->stor == 0) { VK->nstor = VK->nstor + 1; I->stor = VK->nstor; }
+    var b: uint32 = (uint32)2;                                  // (I16[]: RGBA16F; I8[]: RGBA8)
+    if (I->fmt == VK_FORMAT_R8G8B8A8_UNORM()) { b = (uint32)3; }
+    vk_desc_image(b, I->stor, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE(), 0, I->view, VK_IMAGE_LAYOUT_GENERAL());
+  }
+}
+
+fn vk_img_free(I: VkImg*) {
+  if (I->img == 0) { return; }
+  vkDestroyImageView(I->view);
+  vkDestroyImage(I->img);
+  vkFreeMemory(I->mem);
+  I->img = 0; I->view = 0; I->mem = 0;
+}
+
+fn vk_img_create(I: VkImg*, w: int32, h: int32, mips: int32, fmt: uint32, usage: uint32, smp: int32) -> int32 {
+  I->w = w; I->h = h; I->mips = mips; I->fmt = fmt; I->usage = usage; I->smp = smp;
+  I->aspect = VK_IMAGE_ASPECT_COLOR_BIT();
+  if (fmt == VK_FORMAT_D32_SFLOAT()) { I->aspect = VK_IMAGE_ASPECT_DEPTH_BIT(); }
+  var ci: VkImageCreateInfo;
+  ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO();
+  ci.imageType = VK_IMAGE_TYPE_2D();
+  ci.format = fmt;
+  ci.width = (uint32)w; ci.height = (uint32)h; ci.depth = (uint32)1;
+  ci.mipLevels = (uint32)mips; ci.arrayLayers = (uint32)1;
+  ci.samples = VK_SAMPLE_COUNT_1_BIT();
+  ci.tiling = VK_IMAGE_TILING_OPTIMAL();
+  ci.usage = usage;
+  ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE();
+  ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED();
+  if (vk_ok(vkCreateImage(&ci, &I->img), "vkCreateImage".chars) == 0) { return 0; }
+  var req: VkMemoryRequirements;
+  vkGetImageMemoryRequirements(I->img, &req);
+  I->mem = vk_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT(), 0);
+  if (I->mem == 0) { return 0; }
+  vkBindImageMemory(I->img, I->mem);
+  var vi: VkImageViewCreateInfo;
+  vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO();
+  vi.image = I->img;
+  vi.viewType = VK_IMAGE_VIEW_TYPE_2D();
+  vi.format = fmt;
+  vi.aspectMask = I->aspect;
+  vi.levelCount = (uint32)mips; vi.layerCount = (uint32)1;
+  if (vk_ok(vkCreateImageView(&vi, &I->view), "vkCreateImageView".chars) == 0) { return 0; }
+  I->layout = VK_IMAGE_LAYOUT_UNDEFINED(); I->stage = 0; I->access = 0;
+  return 1;
+}
+
+// a render target: w x h of fmt (VK_FORMAT_*), usage (VK_IMAGE_USAGE_*; SAMPLED gets it a T2[] / TS[] index, STORAGE an
+// I16[] / I8[] one), seen through sampler smp (SMP_*). Made again when its size changes (the device idled first); its
+// indices kept. Render targets are read in VK_IMAGE_LAYOUT_GENERAL
+fn vk_target(I: VkImg*, w: int32, h: int32, fmt: uint32, usage: uint32, smp: int32) -> int32 {
+  if (I->img != 0 && I->w == w && I->h == h) { return 1; }
+  if (I->img != 0) { vkDeviceWaitIdle(); vk_img_free(I); }
+  if (vk_img_create(I, w, h, 1, fmt, usage, smp) == 0) { return 0; }
+  vk_img_register(I, VK_IMAGE_LAYOUT_GENERAL());
+  return 1;
+}
+
+fn vk_mips(w: int32, h: int32) -> int32 {
+  var m: int32 = 1;
+  var s: int32 = w;
+  if (h > s) { s = h; }
+  while (s > 1) { s = s / 2; m = m + 1; }
+  return m;
+}
+
+// an RGBA8 texture (px: w x h, rows from the first), its mips made by blits; repeating (SMP_REPEAT) or clamped
+// (SMP_CLAMP_MIP) -> its T2[] index
+fn vk_texture_rgba(px: uint8*, w: int32, h: int32, repeat: int32) -> uint32 {
+  var smp: int32 = SMP_CLAMP_MIP();
+  if (repeat != 0) { smp = SMP_REPEAT(); }
+  return vk_texture_rgba_s(px, w, h, smp, vk_mips(w, h));
+}
+fn vk_texture_rgba_s(px: uint8*, w: int32, h: int32, smp: int32, mips: int32) -> uint32 {
+  var I: VkImg* = new VkImg;
+  var usage: uint32 = VK_IMAGE_USAGE_SAMPLED_BIT() | VK_IMAGE_USAGE_TRANSFER_DST_BIT() | VK_IMAGE_USAGE_TRANSFER_SRC_BIT();
+  if (vk_img_create(I, w, h, mips, VK_FORMAT_R8G8B8A8_UNORM(), usage, smp) == 0) { return (uint32)0; }
+  var bytes: int64 = (int64)w * (int64)h * 4;
+  var S: VkBuf;
+  if (vk_buf_make(&S, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT(), 1) == 0) { return (uint32)0; }
+  memcpy((rawptr)S.map, (rawptr)px, bytes);
+  var cb: int64 = vk_once_begin();
+  var cs: int64 = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT();
+  vk_barrier_raw(cb, I->img, I->aspect, 0, mips, VK_IMAGE_LAYOUT_UNDEFINED(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(),
+                 0, 0, cs, VK_ACCESS_2_TRANSFER_WRITE_BIT());
+  var r: VkBufferImageCopy;
+  r.aspectMask = I->aspect; r.layerCount = (uint32)1;
+  r.width = (uint32)w; r.height = (uint32)h; r.depth = (uint32)1;
+  vkCmdCopyBufferToImage(cb, S.buf, I->img, &r);
+  // each mip from the one above, halved (each level left TRANSFER_SRC once it's made)
+  var m: int32 = 1;
+  var mw: int32 = w;
+  var mh: int32 = h;
+  while (m < mips) {
+    vk_barrier_raw(cb, I->img, I->aspect, m - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL(),
+                   cs, VK_ACCESS_2_TRANSFER_WRITE_BIT(), cs, VK_ACCESS_2_TRANSFER_READ_BIT());
+    var nw: int32 = mw / 2; if (nw < 1) { nw = 1; }
+    var nh: int32 = mh / 2; if (nh < 1) { nh = 1; }
+    var b: VkImageBlit;
+    b.src_aspect = I->aspect; b.src_mip = (uint32)(m - 1); b.src_layers = (uint32)1;
+    b.src_off[3] = mw; b.src_off[4] = mh; b.src_off[5] = 1;
+    b.dst_aspect = I->aspect; b.dst_mip = (uint32)m; b.dst_layers = (uint32)1;
+    b.dst_off[3] = nw; b.dst_off[4] = nh; b.dst_off[5] = 1;
+    vkCmdBlitImage(cb, I->img, I->img, &b, VK_FILTER_LINEAR());
+    mw = nw; mh = nh;
+    m = m + 1;
+  }
+  // all of it read-only from here on (the last level's still TRANSFER_DST, the rest TRANSFER_SRC)
+  if (mips > 1) {
+    vk_barrier_raw(cb, I->img, I->aspect, 0, mips - 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL(),
+                   cs, VK_ACCESS_2_TRANSFER_READ_BIT(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT(), VK_ACCESS_2_SHADER_SAMPLED_READ_BIT());
+  }
+  vk_barrier_raw(cb, I->img, I->aspect, mips - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL(),
+                 cs, VK_ACCESS_2_TRANSFER_WRITE_BIT(), VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT(), VK_ACCESS_2_SHADER_SAMPLED_READ_BIT());
+  vk_once_end();
+  vkDestroyBuffer(S.buf);
+  vkFreeMemory(S.mem);
+  I->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL();
+  vk_img_register(I, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL());
+  VK->tex_img[I->tex] = I;
+  return (uint32)I->tex;
+}
+// a texture vk_texture_rgba made (by its T2[] index), or 0
+fn vk_texture_img(tex: uint32) -> VkImg* {
+  if (tex == (uint32)0 || (int32)tex > VK->ntex) { return (VkImg*)0; }
+  return VK->tex_img[tex];
+}
+
+// ---------------------------------------------------------------- pipelines
+// a graphics pipeline: its two stages, what it draws into (formats: ncol colour, a depth or VK_FORMAT_UNDEFINED), its
+// depth test, culling, blending (on the first colour target: 0 none, 1 adding, 2 over by alpha), whether it's biased
+// (depth bias set as it draws: vkCmdSetDepthBias). Vertices come from buffers by address (none bound)
+struct GfxDesc {
+  vs: int64; fs: int64;
+  ncol: int32; cfmt: uint32[4]; dfmt: uint32;
+  dtest: int32; dwrite: int32; dcmp: uint32;
+  cull: uint32; blend: int32; bias: int32;
+}
+
+fn vk_pipeline_gfx(D: GfxDesc*, what: cstring) -> int64 {
+  if (D->vs == 0 || D->fs == 0) { return 0; }
+  var st: VkPipelineShaderStageCreateInfo[2];
+  st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO();
+  st[0].stage = VK_SHADER_STAGE_VERTEX_BIT(); st[0].module_ = D->vs; st[0].pName = "main".chars;
+  st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO();
+  st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT(); st[1].module_ = D->fs; st[1].pName = "main".chars;
+  var vi: VkPipelineVertexInputStateCreateInfo;
+  vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO();
+  var ia: VkPipelineInputAssemblyStateCreateInfo;
+  ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO();
+  ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST();
+  var vp: VkPipelineViewportStateCreateInfo;
+  vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO();
+  vp.viewportCount = (uint32)1; vp.scissorCount = (uint32)1;
+  var rs: VkPipelineRasterizationStateCreateInfo;
+  rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO();
+  rs.polygonMode = VK_POLYGON_MODE_FILL();
+  rs.cullMode = D->cull;
+  rs.frontFace = VK_FRONT_FACE_CLOCKWISE();                     // (GL's counter-clockwise: see the top)
+  rs.depthBiasEnable = (uint32)D->bias;
+  rs.lineWidth = 1.0;
+  var ms: VkPipelineMultisampleStateCreateInfo;
+  ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO();
+  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT();
+  var ds: VkPipelineDepthStencilStateCreateInfo;
+  ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO();
+  ds.depthTestEnable = (uint32)D->dtest;
+  ds.depthWriteEnable = (uint32)D->dwrite;
+  ds.depthCompareOp = D->dcmp;
+  ds.maxDepthBounds = 1.0;
+  var ba: VkPipelineColorBlendAttachmentState[4];
+  var i: int32 = 0;
+  while (i < 4) { ba[i].colorWriteMask = (uint32)15; i = i + 1; }
+  if (D->blend != 0) {
+    ba[0].blendEnable = (uint32)1;
+    ba[0].colorBlendOp = VK_BLEND_OP_ADD(); ba[0].alphaBlendOp = VK_BLEND_OP_ADD();
+    if (D->blend == 1) {
+      ba[0].srcColorBlendFactor = VK_BLEND_FACTOR_ONE(); ba[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE();
+      ba[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE(); ba[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE();
+    } else {
+      ba[0].srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA(); ba[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA();
+      ba[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE(); ba[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA();
+    }
+  }
+  var cb: VkPipelineColorBlendStateCreateInfo;
+  cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO();
+  cb.attachmentCount = (uint32)D->ncol;
+  cb.pAttachments = &ba[0];
+  var dyn: uint32[3];
+  dyn[0] = VK_DYNAMIC_STATE_VIEWPORT(); dyn[1] = VK_DYNAMIC_STATE_SCISSOR(); dyn[2] = VK_DYNAMIC_STATE_DEPTH_BIAS();
+  var dy: VkPipelineDynamicStateCreateInfo;
+  dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO();
+  dy.dynamicStateCount = (uint32)2;
+  if (D->bias != 0) { dy.dynamicStateCount = (uint32)3; }
+  dy.pDynamicStates = &dyn[0];
+  var pr: VkPipelineRenderingCreateInfo;
+  pr.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO();
+  pr.colorAttachmentCount = (uint32)D->ncol;
+  pr.pColorAttachmentFormats = &D->cfmt[0];
+  pr.depthAttachmentFormat = D->dfmt;
+  var ci: VkGraphicsPipelineCreateInfo;
+  ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO();
+  ci.pNext = (uint8*)&pr;
+  ci.stageCount = (uint32)2;
+  ci.pStages = &st[0];
+  ci.pVertexInputState = &vi;
+  ci.pInputAssemblyState = &ia;
+  ci.pViewportState = &vp;
+  ci.pRasterizationState = &rs;
+  ci.pMultisampleState = &ms;
+  ci.pDepthStencilState = &ds;
+  ci.pColorBlendState = &cb;
+  ci.pDynamicState = &dy;
+  ci.layout_ = VK->layout_;
+  ci.basePipelineIndex = -1;
+  var p: int64 = 0;
+  if (vk_ok(vkCreateGraphicsPipeline(&ci, &p), what) == 0) { return 0; }
+  return p;
+}
+
+fn vk_pipeline_compute(cs: int64, what: cstring) -> int64 {
+  if (cs == 0) { return 0; }
+  var ci: VkComputePipelineCreateInfo;
+  ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO();
+  ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO();
+  ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT();
+  ci.stage.module_ = cs;
+  ci.stage.pName = "main".chars;
+  ci.layout_ = VK->layout_;
+  ci.basePipelineIndex = -1;
+  var p: int64 = 0;
+  if (vk_ok(vkCreateComputePipeline(&ci, &p), what) == 0) { return 0; }
+  return p;
+}
+
+// ---------------------------------------------------------------- recording
+fn vk_cmd() -> int64 { return VK->fr[VK->fi].cmd; }
+
+// the push constants every engine shader reads: the frame's data, the draw's, the game's extension's (addresses)
+fn vk_push(frame: int64, draw: int64, ext: int64) {
+  var pc: int64[4];
+  pc[0] = frame; pc[1] = draw; pc[2] = ext; pc[3] = 0;
+  vkCmdPushConstants(vk_cmd(), (uint8*)&pc[0], (uint32)32);
+}
+
+fn vk_bind_gfx(p: int64) { vkCmdBindPipeline(vk_cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS(), p); }
+fn vk_bind_compute(p: int64) { vkCmdBindPipeline(vk_cmd(), VK_PIPELINE_BIND_POINT_COMPUTE(), p); }
+
+fn vk_viewport(x: int32, y: int32, w: int32, h: int32) {
+  var v: VkViewport;
+  v.x = (float32)x; v.y = (float32)y; v.width = (float32)w; v.height = (float32)h; v.maxDepth = 1.0;
+  vkCmdSetViewport(vk_cmd(), &v);
+  var r: VkRect2D;
+  r.x = x; r.y = y; r.width = (uint32)w; r.height = (uint32)h;
+  vkCmdSetScissor(vk_cmd(), &r);
+}
+
+// drawing begins into up to four colour targets and a depth one (0: none); clear: clear them as it starts (else what's
+// there is kept); dread: the depth only tested, not written. The viewport set to the first target's size
+fn vk_render_begin(c0: VkImg*, c1: VkImg*, c2: VkImg*, c3: VkImg*, depth: VkImg*, clear: int32, dread: int32) {
+  var cs: VkImg*[4];
+  cs[0] = c0; cs[1] = c1; cs[2] = c2; cs[3] = c3;
+  var att: VkRenderingAttachmentInfo[4];
+  var n: int32 = 0;
+  var w: int32 = 0;
+  var h: int32 = 0;
+  while (n < 4 && cs[n] != (VkImg*)0) {
+    var I: VkImg* = cs[n];
+    vk_use(I, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL(), VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT(),
+           VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT() | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT());
+    att[n].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO();
+    att[n].imageView = I->view;
+    att[n].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL();
+    att[n].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD();
+    if (clear != 0) { att[n].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR(); }
+    att[n].storeOp = VK_ATTACHMENT_STORE_OP_STORE();
+    w = I->w; h = I->h;
+    n = n + 1;
+  }
+  var da: VkRenderingAttachmentInfo;
+  if (depth != (VkImg*)0) {
+    var acc: int64 = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT();
+    if (dread == 0) { acc = acc | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT(); }
+    vk_use(depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL(),
+           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT() | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT(), acc);
+    da.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO();
+    da.imageView = depth->view;
+    da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL();
+    da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD();
+    if (clear != 0) { da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR(); }
+    da.storeOp = VK_ATTACHMENT_STORE_OP_STORE();
+    da.clear[0] = 1.0;
+    if (n == 0) { w = depth->w; h = depth->h; }
+  }
+  var ri: VkRenderingInfo;
+  ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO();
+  ri.width = (uint32)w; ri.height = (uint32)h;
+  ri.layerCount = (uint32)1;
+  ri.colorAttachmentCount = (uint32)n;
+  if (n > 0) { ri.pColorAttachments = &att[0]; }
+  if (depth != (VkImg*)0) { ri.pDepthAttachment = &da; }
+  vkCmdBeginRendering(vk_cmd(), &ri);
+  vk_viewport(0, 0, w, h);
+  VK->n_passes = VK->n_passes + 1;
+}
+fn vk_render_end() { vkCmdEndRendering(vk_cmd()); }
+
+fn vk_draw(n: int32) { vkCmdDraw(vk_cmd(), (uint32)n, (uint32)0); vk_count_draw((int64)n); }
+// n vertices from the first'th (gl_VertexIndex counts on from it: a batch's later stretch)
+fn vk_draw_from(first: int32, n: int32) { vkCmdDraw(vk_cmd(), (uint32)n, (uint32)first); vk_count_draw((int64)n); }
+// the depth bias (pipelines made with GfxDesc.bias): constant, slope -- as glPolygonOffset's units, factor
+fn vk_depth_bias(constant: float64, slope: float64) { vkCmdSetDepthBias(vk_cmd(), (float32)constant, 0.0, (float32)slope); }
+
+// a colour target cleared to nothing (it's left GENERAL; its usage must include TRANSFER_DST)
+fn vk_clear(I: VkImg*) {
+  vk_use(I, VK_IMAGE_LAYOUT_GENERAL(), VK_PIPELINE_STAGE_2_CLEAR_BIT(), VK_ACCESS_2_TRANSFER_WRITE_BIT());
+  var f: fn(int64, int64, uint32, float32*, uint32, uint32*) -> void = (fn(int64, int64, uint32, float32*, uint32, uint32*) -> void)vkp->CmdClearColorImage;
+  var c: float32[4];
+  var r: uint32[5];
+  r[0] = I->aspect; r[1] = (uint32)0; r[2] = (uint32)I->mips; r[3] = (uint32)0; r[4] = (uint32)1;
+  f(vk_cmd(), I->img, VK_IMAGE_LAYOUT_GENERAL(), &c[0], (uint32)1, &r[0]);
+}
+fn vk_draw_indexed(ib: VkBuf*, first: int32, n: int32) {
+  vkCmdBindIndexBuffer(vk_cmd(), ib->buf);
+  vkCmdDrawIndexed(vk_cmd(), (uint32)n, (uint32)first);
+  vk_count_draw((int64)n);
+}
+// a compute pass over w x h (8 x 8 groups: local_size 8 8 in the shader)
+fn vk_dispatch(w: int32, h: int32) {
+  vkCmdDispatch(vk_cmd(), (uint32)((w + 7) / 8), (uint32)((h + 7) / 8));
+  VK->n_dispatch = VK->n_dispatch + 1;
+}
+
+// a GPU timestamp (after all that came before) -> its slot this frame (-1: none left)
+fn vk_timestamp() -> int32 {
+  var F: VkFrame* = &VK->fr[VK->fi];
+  if (F->nq >= VK_QUERIES()) { return -1; }
+  vkCmdWriteTimestamp2(vk_cmd(), F->qpool, (uint32)F->nq);
+  F->nq = F->nq + 1;
+  return F->nq - 1;
+}
+
+// ---------------------------------------------------------------- the instance, the device
+fn vk_debug_cb(sev: uint32, types: uint32, data: uint8*, user: uint8*) -> uint32 {
+  var msg: cstring = *(cstring*)(data + 40);                     // (VkDebugUtilsMessengerCallbackDataEXT.pMessage)
+  if ((sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT()) != (uint32)0) { print("[vk error] "); }
+  else { print("[vk warning] "); }
+  println_cstr(msg);
+  return (uint32)0;
+}
+
+fn vk_validation(on: int32) {
+  if (VK == 0) { VK = new Vk; }
+  VK->validate = on;
+}
+
+fn vk_env_on(name: cstring) -> int32 {
+  var buf: uint8[8];
+  var n: uint32 = Vk_GetEnvironmentVariableA(name, &buf[0], (uint32)8);
+  if (n > (uint32)0 && buf[0] == (uint8)49) { return 1; }        // ('1')
+  return 0;
+}
+
+fn vk_instance() -> int32 {
+  var app: VkApplicationInfo;
+  app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO();
+  app.pApplicationName = "Mettle".chars;
+  app.pEngineName = "Mettle engine".chars;
+  app.apiVersion = VK_API_VERSION_1_4();
+  var ext: cstring[3];
+  ext[0] = "VK_KHR_surface".chars;
+  ext[1] = "VK_KHR_win32_surface".chars;
+  ext[2] = "VK_EXT_debug_utils".chars;
+  var layer: cstring[1];
+  layer[0] = "VK_LAYER_KHRONOS_validation".chars;
+  var ci: VkInstanceCreateInfo;
+  ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO();
+  ci.pApplicationInfo = &app;
+  ci.enabledExtensionCount = (uint32)2;
+  ci.ppEnabledExtensionNames = &ext[0];
+  if (VK->validate != 0) {
+    ci.enabledExtensionCount = (uint32)3;
+    ci.enabledLayerCount = (uint32)1;
+    ci.ppEnabledLayerNames = &layer[0];
+  }
+  var r: int32 = vkCreateInstance(&ci, &VK->instance);
+  if (r == VK_ERROR_LAYER_NOT_PRESENT() || r == VK_ERROR_EXTENSION_NOT_PRESENT()) {
+    println("vulkan: the validation layer isn't installed (the Vulkan SDK has it) -- going on without it");
+    VK->validate = 0;
+    ci.enabledExtensionCount = (uint32)2;
+    ci.enabledLayerCount = (uint32)0;
+    r = vkCreateInstance(&ci, &VK->instance);
+  }
+  if (vk_ok(r, "vkCreateInstance".chars) == 0) { return 0; }
+  vk_load_instance_procs();
+  if (VK->validate != 0) {
+    vkp->CreateDebugUtilsMessengerEXT = vk_gip("vkCreateDebugUtilsMessengerEXT".chars);
+    var di: VkDebugUtilsMessengerCreateInfoEXT;
+    di.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT();
+    di.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT() | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT();
+    di.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT() | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT()
+      | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT();
+    di.pfnUserCallback = vk_debug_cb;
+    if (vkp->CreateDebugUtilsMessengerEXT != 0) { vkCreateDebugUtilsMessengerEXT(&di, &VK->messenger); }
+  }
+  return 1;
+}
+
+// what the engine needs of a device: Vulkan 1.3, and of its features these
+fn vk_features_ok(pd: int64) -> int32 {
+  var f13: VkFeatures13;
+  f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES();
+  var f12: VkFeatures12;
+  f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES();
+  f12.pNext = (uint8*)&f13;
+  var f2: VkFeatures2;
+  f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2();
+  f2.pNext = (uint8*)&f12;
+  vkGetPhysicalDeviceFeatures2(pd, &f2);
+  if (f12.f[VK12_BUFFER_DEVICE_ADDRESS()] == (uint32)0 || f12.f[VK12_RUNTIME_ARRAY()] == (uint32)0
+      || f12.f[VK12_PARTIALLY_BOUND()] == (uint32)0 || f12.f[VK12_SAMPLED_UPDATE_AFTER_BIND()] == (uint32)0
+      || f12.f[VK12_STORAGE_UPDATE_AFTER_BIND()] == (uint32)0 || f12.f[VK12_UPDATE_UNUSED_WHILE_PENDING()] == (uint32)0
+      || f13.f[VK13_DYNAMIC_RENDERING()] == (uint32)0 || f13.f[VK13_SYNCHRONIZATION2()] == (uint32)0
+      || f2.f[VK10_SAMPLED_DYNAMIC_INDEXING()] == (uint32)0 || f2.f[VK10_STORAGE_DYNAMIC_INDEXING()] == (uint32)0) {
+    return 0;
+  }
+  VK->aniso = (int32)f2.f[VK10_SAMPLER_ANISOTROPY()];
+  return 1;
+}
+
+// the GPU: the first discrete one that has what the engine needs (else any that does), and its queue that draws,
+// computes and presents
+fn vk_pick_device() -> int32 {
+  var n: uint32 = (uint32)0;
+  vkEnumeratePhysicalDevices(&n, (int64*)0);
+  if (n == (uint32)0) { println("vulkan: no GPU"); return 0; }
+  if (n > (uint32)16) { n = (uint32)16; }
+  var pds: int64[16];
+  vkEnumeratePhysicalDevices(&n, &pds[0]);
+  VK->props = (uint8*)malloc(1024);
+  var qp: uint8* = (uint8*)malloc(24 * 64);
+  var best: int32 = -1;
+  var best_q: uint32 = (uint32)0;
+  var best_discrete: int32 = 0;
+  var i: int32 = 0;
+  while (i < (int32)n) {
+    vkGetPhysicalDeviceProperties(pds[i], VK->props);
+    var api: uint32 = *(uint32*)VK->props;
+    var typ: uint32 = *(uint32*)(VK->props + 16);
+    if (api >= VK_API_VERSION_1_3() && vk_features_ok(pds[i]) != 0) {
+      var nq: uint32 = (uint32)64;
+      vkGetPhysicalDeviceQueueFamilyProperties(pds[i], &nq, qp);
+      var q: uint32 = (uint32)0;
+      var found: int32 = 0;
+      while (q < nq && found == 0) {
+        var flags: uint32 = *(uint32*)(qp + (int64)q * 24);
+        var want: uint32 = VK_QUEUE_GRAPHICS_BIT() | VK_QUEUE_COMPUTE_BIT();
+        var present: uint32 = (uint32)0;
+        vkGetPhysicalDeviceSurfaceSupportKHR(pds[i], q, &present);
+        if ((flags & want) == want && present != (uint32)0) { found = 1; }
+        else { q = q + (uint32)1; }
+      }
+      var discrete: int32 = 0;
+      if (typ == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU()) { discrete = 1; }
+      if (found != 0 && (best < 0 || (discrete != 0 && best_discrete == 0))) {
+        best = i; best_q = q; best_discrete = discrete;
+      }
+    }
+    i = i + 1;
+  }
+  free(qp);
+  if (best < 0) { println("vulkan: no GPU with Vulkan 1.3, dynamic rendering, buffer addresses and bindless descriptors"); return 0; }
+  VK->phys = pds[best];
+  VK->qfam = best_q;
+  vkGetPhysicalDeviceProperties(VK->phys, VK->props);
+  vk_features_ok(VK->phys);
+  VK->api = *(uint32*)VK->props;
+  VK->ts_period = (float64)*(float32*)(VK->props + 296 + 424);   // (limits.timestampPeriod)
+  VK->mem = (uint8*)malloc(520);
+  vkGetPhysicalDeviceMemoryProperties(VK->phys, VK->mem);
+  return 1;
+}
+
+fn vk_device() -> int32 {
+  var prio: float32 = 1.0;
+  var qi: VkDeviceQueueCreateInfo;
+  qi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO();
+  qi.queueFamilyIndex = VK->qfam;
+  qi.queueCount = (uint32)1;
+  qi.pQueuePriorities = &prio;
+  var f13: VkFeatures13;
+  f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES();
+  f13.f[VK13_DYNAMIC_RENDERING()] = (uint32)1;
+  f13.f[VK13_SYNCHRONIZATION2()] = (uint32)1;
+  var f12: VkFeatures12;
+  f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES();
+  f12.pNext = (uint8*)&f13;
+  f12.f[VK12_DESCRIPTOR_INDEXING()] = (uint32)1;
+  f12.f[VK12_RUNTIME_ARRAY()] = (uint32)1;
+  f12.f[VK12_PARTIALLY_BOUND()] = (uint32)1;
+  f12.f[VK12_SAMPLED_UPDATE_AFTER_BIND()] = (uint32)1;
+  f12.f[VK12_STORAGE_UPDATE_AFTER_BIND()] = (uint32)1;
+  f12.f[VK12_UPDATE_UNUSED_WHILE_PENDING()] = (uint32)1;
+  f12.f[VK12_BUFFER_DEVICE_ADDRESS()] = (uint32)1;
+  var f2: VkFeatures2;
+  f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2();
+  f2.pNext = (uint8*)&f12;
+  f2.f[VK10_SAMPLER_ANISOTROPY()] = (uint32)VK->aniso;
+  f2.f[VK10_SAMPLED_DYNAMIC_INDEXING()] = (uint32)1;
+  f2.f[VK10_STORAGE_DYNAMIC_INDEXING()] = (uint32)1;
+  var ext: cstring[1];
+  ext[0] = "VK_KHR_swapchain".chars;
+  var ci: VkDeviceCreateInfo;
+  ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO();
+  ci.pNext = (uint8*)&f2;
+  ci.queueCreateInfoCount = (uint32)1;
+  ci.pQueueCreateInfos = &qi;
+  ci.enabledExtensionCount = (uint32)1;
+  ci.ppEnabledExtensionNames = &ext[0];
+  if (vk_ok(vkCreateDevice(&ci, &VK->device), "vkCreateDevice".chars) == 0) { return 0; }
+  if (vk_load_device_procs() == 0) { return 0; }
+  vkGetDeviceQueue(VK->qfam, &VK->queue);
+  return 1;
+}
+
+fn vk_sampler(mag: uint32, mipmode: uint32, addr: uint32, maxlod: float32, aniso: int32, compare: int32) -> int64 {
+  var ci: VkSamplerCreateInfo;
+  ci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO();
+  ci.magFilter = mag; ci.minFilter = mag;
+  ci.mipmapMode = mipmode;
+  ci.addressModeU = addr; ci.addressModeV = addr; ci.addressModeW = addr;
+  ci.maxLod = maxlod;
+  if (aniso != 0 && VK->aniso != 0) { ci.anisotropyEnable = (uint32)1; ci.maxAnisotropy = 8.0; }
+  if (compare != 0) { ci.compareEnable = (uint32)1; ci.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL(); }
+  ci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE();
+  var s: int64 = 0;
+  vk_ok(vkCreateSampler(&ci, &s), "vkCreateSampler".chars);
+  return s;
+}
+
+// the one descriptor set: T2[] (binding 0), TS[] (1), I16[] (2), I8[] (3); the one pipeline layout (it, 32 bytes of
+// push constants); the samplers
+fn vk_bindless() -> int32 {
+  var b: VkDescriptorSetLayoutBinding[4];
+  var fl: uint32[4];
+  var i: int32 = 0;
+  while (i < 4) {
+    b[i].binding = (uint32)i;
+    b[i].stageFlags = VK_SHADER_STAGE_ALL();
+    fl[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT() | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT()
+      | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT();
+    i = i + 1;
+  }
+  b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER(); b[0].descriptorCount = (uint32)VK_NTEX();
+  b[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER(); b[1].descriptorCount = (uint32)VK_NSHADOW();
+  b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE(); b[2].descriptorCount = (uint32)VK_NSTOR();
+  b[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE(); b[3].descriptorCount = (uint32)VK_NSTOR();
+  var bf: VkDescriptorSetLayoutBindingFlagsCreateInfo;
+  bf.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO();
+  bf.bindingCount = (uint32)4;
+  bf.pBindingFlags = &fl[0];
+  var lc: VkDescriptorSetLayoutCreateInfo;
+  lc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO();
+  lc.pNext = (uint8*)&bf;
+  lc.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT();
+  lc.bindingCount = (uint32)4;
+  lc.pBindings = &b[0];
+  if (vk_ok(vkCreateDescriptorSetLayout(&lc, &VK->dsl), "vkCreateDescriptorSetLayout".chars) == 0) { return 0; }
+  var ps: VkDescriptorPoolSize[2];
+  ps[0].typ = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER(); ps[0].descriptorCount = (uint32)(VK_NTEX() + VK_NSHADOW());
+  ps[1].typ = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE(); ps[1].descriptorCount = (uint32)(VK_NSTOR() * 2);
+  var pc: VkDescriptorPoolCreateInfo;
+  pc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO();
+  pc.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT();
+  pc.maxSets = (uint32)1;
+  pc.poolSizeCount = (uint32)2;
+  pc.pPoolSizes = &ps[0];
+  if (vk_ok(vkCreateDescriptorPool(&pc, &VK->dpool), "vkCreateDescriptorPool".chars) == 0) { return 0; }
+  var ai: VkDescriptorSetAllocateInfo;
+  ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO();
+  ai.descriptorPool = VK->dpool;
+  ai.descriptorSetCount = (uint32)1;
+  ai.pSetLayouts = &VK->dsl;
+  if (vk_ok(vkAllocateDescriptorSets(&ai, &VK->dset), "vkAllocateDescriptorSets".chars) == 0) { return 0; }
+  VK->tex_img = (VkImg**)malloc((int64)VK_NTEX() * 8);
+  memset((rawptr)VK->tex_img, 0, (int64)VK_NTEX() * 8);
+  var pr: VkPushConstantRange;
+  pr.stageFlags = VK_SHADER_STAGE_ALL();
+  pr.size = (uint32)32;
+  var li: VkPipelineLayoutCreateInfo;
+  li.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO();
+  li.setLayoutCount = (uint32)1;
+  li.pSetLayouts = &VK->dsl;
+  li.pushConstantRangeCount = (uint32)1;
+  li.pPushConstantRanges = &pr;
+  if (vk_ok(vkCreatePipelineLayout(&li, &VK->layout_), "vkCreatePipelineLayout".chars) == 0) { return 0; }
+  var none: float32 = 0.0;
+  var all: float32 = 16.0;
+  VK->smp[SMP_NEAREST()] = vk_sampler(VK_FILTER_NEAREST(), VK_SAMPLER_MIPMAP_MODE_NEAREST(), VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE(), none, 0, 0);
+  VK->smp[SMP_LINEAR()] = vk_sampler(VK_FILTER_LINEAR(), VK_SAMPLER_MIPMAP_MODE_NEAREST(), VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE(), none, 0, 0);
+  VK->smp[SMP_REPEAT()] = vk_sampler(VK_FILTER_LINEAR(), VK_SAMPLER_MIPMAP_MODE_LINEAR(), VK_SAMPLER_ADDRESS_MODE_REPEAT(), all, 1, 0);
+  VK->smp[SMP_CLAMP_MIP()] = vk_sampler(VK_FILTER_LINEAR(), VK_SAMPLER_MIPMAP_MODE_LINEAR(), VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE(), all, 0, 0);
+  VK->smp[SMP_SHADOW()] = vk_sampler(VK_FILTER_LINEAR(), VK_SAMPLER_MIPMAP_MODE_NEAREST(), VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE(), none, 0, 1);
+  return 1;
+}
+
+fn vk_frames() -> int32 {
+  var pc: VkCommandPoolCreateInfo;
+  pc.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO();
+  pc.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT();
+  pc.queueFamilyIndex = VK->qfam;
+  if (vk_ok(vkCreateCommandPool(&pc, &VK->pool), "vkCreateCommandPool".chars) == 0) { return 0; }
+  var ai: VkCommandBufferAllocateInfo;
+  ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO();
+  ai.commandPool = VK->pool;
+  ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY();
+  ai.commandBufferCount = (uint32)1;
+  vkAllocateCommandBuffers(&ai, &VK->once);
+  var fc: VkFenceCreateInfo;
+  fc.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO();
+  fc.flags = VK_FENCE_CREATE_SIGNALED_BIT();
+  var sc: VkSemaphoreCreateInfo;
+  sc.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO();
+  var qc: VkQueryPoolCreateInfo;
+  qc.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO();
+  qc.queryType = VK_QUERY_TYPE_TIMESTAMP();
+  qc.queryCount = (uint32)VK_QUERIES();
+  var i: int32 = 0;
+  while (i < VK_FRAMES()) {
+    var F: VkFrame* = &VK->fr[i];
+    vkAllocateCommandBuffers(&ai, &F->cmd);
+    vkCreateFence(&fc, &F->fence);
+    vkCreateSemaphore(&sc, &F->acquired);
+    vkCreateQueryPool(&qc, &F->qpool);
+    if (vk_buf_make(&F->ring, VK_RING(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT(), 1) == 0) { return 0; }
+    i = i + 1;
+  }
+  return 1;
+}
+
+// ---------------------------------------------------------------- the swapchain
+fn vk_swapchain(w: int32, h: int32) -> int32 {
+  vkDeviceWaitIdle();
+  var caps: uint32[13];
+  vkGetPhysicalDeviceSurfaceCapabilitiesKHR(&caps[0]);
+  var ew: uint32 = caps[2];
+  var eh: uint32 = caps[3];
+  if (ew == (uint32)0xFFFFFFFF) {
+    ew = (uint32)w; eh = (uint32)h;
+    if (ew < caps[4]) { ew = caps[4]; }
+    if (ew > caps[6]) { ew = caps[6]; }
+    if (eh < caps[5]) { eh = caps[5]; }
+    if (eh > caps[7]) { eh = caps[7]; }
+  }
+  if (ew == (uint32)0 || eh == (uint32)0) { return 0; }        // (minimised)
+  if (VK->sc_fmt == (uint32)0) {
+    var nf: uint32 = (uint32)0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(&nf, (uint32*)0);
+    if (nf > (uint32)64) { nf = (uint32)64; }
+    var fm: uint32[128];
+    vkGetPhysicalDeviceSurfaceFormatsKHR(&nf, &fm[0]);
+    VK->sc_fmt = fm[0];
+    var k: uint32 = (uint32)0;
+    while (k < nf) {
+      var f: uint32 = fm[k * (uint32)2];
+      if ((f == VK_FORMAT_B8G8R8A8_UNORM() || f == VK_FORMAT_R8G8B8A8_UNORM())
+          && fm[k * (uint32)2 + (uint32)1] == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR()) {
+        VK->sc_fmt = f;
+      }
+      k = k + (uint32)1;
+    }
+  }
+  // the present mode: vsync waits for the display (FIFO, always there); else the newest image wins (MAILBOX) or
+  // nothing waits (IMMEDIATE)
+  var mode: uint32 = VK_PRESENT_MODE_FIFO_KHR();
+  if (VK->vsync == 0) {
+    var nm: uint32 = (uint32)0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(&nm, (uint32*)0);
+    if (nm > (uint32)16) { nm = (uint32)16; }
+    var pm: uint32[16];
+    vkGetPhysicalDeviceSurfacePresentModesKHR(&nm, &pm[0]);
+    var j: uint32 = (uint32)0;
+    while (j < nm) {
+      if (pm[j] == VK_PRESENT_MODE_IMMEDIATE_KHR() && mode == VK_PRESENT_MODE_FIFO_KHR()) { mode = pm[j]; }
+      if (pm[j] == VK_PRESENT_MODE_MAILBOX_KHR()) { mode = pm[j]; }
+      j = j + (uint32)1;
+    }
+  }
+  var want: uint32 = caps[0] + (uint32)1;
+  if (caps[1] != (uint32)0 && want > caps[1]) { want = caps[1]; }
+  if (want > (uint32)8) { want = (uint32)8; }
+  var ci: VkSwapchainCreateInfoKHR;
+  ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR();
+  ci.surface = VK->surface;
+  ci.minImageCount = want;
+  ci.imageFormat = VK->sc_fmt;
+  ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR();
+  ci.width = ew; ci.height = eh;
+  ci.imageArrayLayers = (uint32)1;
+  ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT() | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT();
+  ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE();
+  ci.preTransform = caps[10];
+  ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR();
+  ci.presentMode = mode;
+  ci.clipped = (uint32)1;
+  ci.oldSwapchain = VK->sc;
+  var sc: int64 = 0;
+  if (vk_ok(vkCreateSwapchainKHR(&ci, &sc), "vkCreateSwapchainKHR".chars) == 0) { return 0; }
+  if (VK->sc != 0) { vkDestroySwapchainKHR(VK->sc); }
+  VK->sc = sc;
+  VK->sc_w = (int32)ew; VK->sc_h = (int32)eh;
+  var n: uint32 = (uint32)0;
+  vkGetSwapchainImagesKHR(&n, (int64*)0);
+  if (n > (uint32)8) { println("vulkan: more than 8 swapchain images"); return 0; }
+  vkGetSwapchainImagesKHR(&n, &VK->sc_img[0]);
+  VK->sc_n = n;
+  var s: VkSemaphoreCreateInfo;
+  s.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO();
+  var i: uint32 = (uint32)0;
+  while (i < n) {
+    if (VK->sc_done[i] == 0) { vkCreateSemaphore(&s, &VK->sc_done[i]); }
+    i = i + (uint32)1;
+  }
+  VK->sc_dirty = 0;
+  return 1;
+}
+
+fn vk_client_size(w: int32*, h: int32*) {
+  var r: int32[4];
+  Vk_GetClientRect(VK->hwnd, &r[0]);
+  *w = r[2] - r[0];
+  *h = r[3] - r[1];
+}
+
+// everything up to the first frame: the instance (validated when asked), the window's surface, the device, the
+// bindless set, the frames' command buffers and rings, the swapchain, shaderc
+fn vk_create(hwnd: int64) -> int32 {
+  if (VK == 0) { VK = new Vk; }
+  if (vk_env_on("METTLE_VK_VALIDATE".chars) != 0) { VK->validate = 1; }
+  VK->hwnd = hwnd;
+  VK->vsync = 1;
+  if (vk_layout_ok() == 0) { return 0; }
+  vkp = new VkProcs;
+  VK->dll = Vk_LoadLibraryA("vulkan-1.dll".chars);
+  if (VK->dll == 0) { println("vulkan-1.dll not found: no Vulkan driver"); return 0; }
+  vkp->GetInstanceProcAddr = Vk_GetProcAddress(VK->dll, "vkGetInstanceProcAddr".chars);
+  vkp->CreateInstance = vk_gip("vkCreateInstance".chars);
+  if (vkp->CreateInstance == 0) { return 0; }
+  if (vk_instance() == 0) { return 0; }
+  var si: VkWin32SurfaceCreateInfoKHR;
+  si.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR();
+  si.hinstance = Vk_GetModuleHandleA((cstring)0);
+  si.hwnd = hwnd;
+  if (vk_ok(vkCreateWin32SurfaceKHR(&si, &VK->surface), "vkCreateWin32SurfaceKHR".chars) == 0) { return 0; }
+  if (vk_pick_device() == 0) { return 0; }
+  if (vk_device() == 0) { return 0; }
+  if (vk_bindless() == 0) { return 0; }
+  if (vk_frames() == 0) { return 0; }
+  var w: int32 = 0;
+  var h: int32 = 0;
+  vk_client_size(&w, &h);
+  if (vk_swapchain(w, h) == 0) { VK->sc_dirty = 1; }
+  if (shaderc_load() == 0) { return 0; }
+  var name: cstring = (cstring)(VK->props + 20);
+  print("vulkan: "); print_cstr(name);
+  var maj: uint32 = VK->api >> (uint32)22;
+  var mnr: uint32 = (VK->api >> (uint32)12) & (uint32)1023;
+  print(", Vulkan {maj}.{mnr}");
+  if (VK->validate != 0) { print(", validated"); }
+  println("");
+  return 1;
+}
+
+// vsync on (FIFO) or off (MAILBOX / IMMEDIATE where the display has them): the swapchain's made again
+fn vk_vsync(on: int32) {
+  if (VK->vsync == on) { return; }
+  VK->vsync = on;
+  VK->sc_dirty = 1;
+}
+
+// ---------------------------------------------------------------- the frame
+// the frame begins: this slot's last frame waited on (its timestamps read back: VK->ts, VK->ts_n), the next swapchain
+// image taken, recording started with the bindless set bound. 0: no frame (minimised, or the swapchain's being made
+// again) -- draw nothing
+fn vk_frame_begin() -> int32 {
+  var w: int32 = 0;
+  var h: int32 = 0;
+  vk_client_size(&w, &h);
+  if (w <= 0 || h <= 0) { return 0; }
+  if (VK->sc_dirty != 0 || w != VK->sc_w || h != VK->sc_h) {
+    if (vk_swapchain(w, h) == 0) { return 0; }
+  }
+  var F: VkFrame* = &VK->fr[VK->fi];
+  vkWaitForFence(&F->fence);
+  VK->ts_n = 0;
+  if (F->nq > 0 && vkGetQueryPoolResults(F->qpool, (uint32)F->nq, &VK->ts[0]) == VK_SUCCESS()) {
+    VK->ts_n = F->nq;
+    var i: int32 = 0;
+    while (i < F->nq) { VK->ts[i] = (int64)((float64)VK->ts[i] * VK->ts_period); i = i + 1; }
+  }
+  var r: int32 = vkAcquireNextImageKHR(F->acquired, &VK->img_i);
+  if (r == VK_ERROR_OUT_OF_DATE_KHR()) { VK->sc_dirty = 1; return 0; }
+  if (r != VK_SUCCESS() && r != VK_SUBOPTIMAL_KHR()) { vk_ok(r, "vkAcquireNextImageKHR".chars); return 0; }
+  if (r == VK_SUBOPTIMAL_KHR()) { VK->sc_dirty = 1; }
+  vkResetFence(&F->fence);
+  vkResetCommandBuffer(F->cmd);
+  var bi: VkCommandBufferBeginInfo;
+  bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO();
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT();
+  vkBeginCommandBuffer(F->cmd, &bi);
+  vkCmdResetQueryPool(F->cmd, F->qpool, (uint32)VK_QUERIES());
+  F->nq = 0;
+  F->ring_off = 0;
+  vkCmdBindDescriptorSet(F->cmd, VK_PIPELINE_BIND_POINT_GRAPHICS());
+  vkCmdBindDescriptorSet(F->cmd, VK_PIPELINE_BIND_POINT_COMPUTE());
+  vk_stats_reset();
+  VK->in_frame = 1;
+  return 1;
+}
+
+// the frame ends: `src` (the finished picture, GL's way up) blitted onto the swapchain's image the right way up,
+// recording ended, submitted (after the image is acquired; signalling it's done, and the slot's fence)
+fn vk_frame_end(src: VkImg*) {
+  if (VK->in_frame == 0) { return; }
+  var cb: int64 = vk_cmd();
+  var F: VkFrame* = &VK->fr[VK->fi];
+  var dst: int64 = VK->sc_img[VK->img_i];
+  vk_use(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL(), VK_PIPELINE_STAGE_2_BLIT_BIT(), VK_ACCESS_2_TRANSFER_READ_BIT());
+  vk_barrier_raw(cb, dst, VK_IMAGE_ASPECT_COLOR_BIT(), 0, 1, VK_IMAGE_LAYOUT_UNDEFINED(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(),
+                 VK_PIPELINE_STAGE_2_BLIT_BIT(), 0, VK_PIPELINE_STAGE_2_BLIT_BIT(), VK_ACCESS_2_TRANSFER_WRITE_BIT());
+  var b: VkImageBlit;
+  b.src_aspect = VK_IMAGE_ASPECT_COLOR_BIT(); b.src_layers = (uint32)1;
+  b.src_off[3] = src->w; b.src_off[4] = src->h; b.src_off[5] = 1;
+  b.dst_aspect = VK_IMAGE_ASPECT_COLOR_BIT(); b.dst_layers = (uint32)1;
+  b.dst_off[1] = VK->sc_h;                                      // (flipped: the picture's row 0 is its bottom)
+  b.dst_off[3] = VK->sc_w; b.dst_off[4] = 0; b.dst_off[5] = 1;
+  var filt: uint32 = VK_FILTER_NEAREST();
+  if (src->w != VK->sc_w || src->h != VK->sc_h) { filt = VK_FILTER_LINEAR(); }
+  vkCmdBlitImage(cb, src->img, dst, &b, filt);
+  vk_barrier_raw(cb, dst, VK_IMAGE_ASPECT_COLOR_BIT(), 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL(), VK_IMAGE_LAYOUT_PRESENT_SRC_KHR(),
+                 VK_PIPELINE_STAGE_2_BLIT_BIT(), VK_ACCESS_2_TRANSFER_WRITE_BIT(), VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT(), 0);
+  vkEndCommandBuffer(cb);
+  var wait_stage: uint32 = (uint32)0x1000;                      // (VK_PIPELINE_STAGE_TRANSFER_BIT: the blit waits)
+  var si: VkSubmitInfo;
+  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO();
+  si.waitSemaphoreCount = (uint32)1;
+  si.pWaitSemaphores = &F->acquired;
+  si.pWaitDstStageMask = &wait_stage;
+  si.commandBufferCount = (uint32)1;
+  si.pCommandBuffers = &F->cmd;
+  si.signalSemaphoreCount = (uint32)1;
+  si.pSignalSemaphores = &VK->sc_done[VK->img_i];
+  vk_ok(vkQueueSubmit(&si, F->fence), "vkQueueSubmit".chars);
+}
+
+// the frame shown (once it's done), and the next slot's turn
+fn vk_present() {
+  if (VK->in_frame == 0) { return; }
+  VK->in_frame = 0;
+  var pi: VkPresentInfoKHR;
+  pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR();
+  pi.waitSemaphoreCount = (uint32)1;
+  pi.pWaitSemaphores = &VK->sc_done[VK->img_i];
+  pi.swapchainCount = (uint32)1;
+  pi.pSwapchains = &VK->sc;
+  pi.pImageIndices = &VK->img_i;
+  var r: int32 = vkQueuePresentKHR(&pi);
+  if (r == VK_ERROR_OUT_OF_DATE_KHR() || r == VK_SUBOPTIMAL_KHR()) { VK->sc_dirty = 1; }
+  else { vk_ok(r, "vkQueuePresentKHR".chars); }
+  VK->fi = (VK->fi + 1) % VK_FRAMES();
+}
+
+// all of the GPU's work finished (before the app exits)
+fn vk_idle() { if (VK != 0 && VK->device != 0) { vkDeviceWaitIdle(); } }
+
+// an RGBA8 image saved as a 32-bit BMP (the GPU idled first; the image is left TRANSFER_SRC). Its rows from row 0 up,
+// as BMP has them: a picture the GL way up comes out the right way up. 0: it failed
+fn vk_save_bmp(I: VkImg*, path: cstring) -> int32 {
+  if (I->img == 0 || I->fmt != VK_FORMAT_R8G8B8A8_UNORM()) { return 0; }
+  vkDeviceWaitIdle();
+  var n: int64 = (int64)I->w * (int64)I->h * 4;
+  var S: VkBuf;
+  if (vk_buf_make(&S, n, VK_BUFFER_USAGE_TRANSFER_DST_BIT(), 1) == 0) { return 0; }
+  var cb: int64 = vk_once_begin();
+  vk_barrier_raw(cb, I->img, I->aspect, 0, I->mips, I->layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL(),
+                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT(), VK_ACCESS_2_MEMORY_WRITE_BIT(), VK_PIPELINE_STAGE_2_COPY_BIT(), VK_ACCESS_2_TRANSFER_READ_BIT());
+  var r: VkBufferImageCopy;
+  r.aspectMask = I->aspect; r.layerCount = (uint32)1;
+  r.width = (uint32)I->w; r.height = (uint32)I->h; r.depth = (uint32)1;
+  var f: fn(int64, int64, uint32, int64, uint32, VkBufferImageCopy*) -> void = (fn(int64, int64, uint32, int64, uint32, VkBufferImageCopy*) -> void)vkp->CmdCopyImageToBuffer;
+  f(cb, I->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL(), S.buf, (uint32)1, &r);
+  vk_once_end();
+  I->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL(); I->stage = VK_PIPELINE_STAGE_2_COPY_BIT(); I->access = VK_ACCESS_2_TRANSFER_READ_BIT();
+  var hd: uint8[54];
+  var file: int32 = (int32)(54 + n);
+  hd[0] = (uint8)66; hd[1] = (uint8)77;                         // ("BM")
+  *(int32*)&hd[2] = file;
+  *(int32*)&hd[10] = 54;
+  *(int32*)&hd[14] = 40;
+  *(int32*)&hd[18] = I->w;
+  *(int32*)&hd[22] = I->h;
+  hd[26] = (uint8)1; hd[28] = (uint8)32;
+  *(int32*)&hd[34] = (int32)n;
+  var px: uint8* = (uint8*)malloc(n);
+  var i: int64 = 0;
+  while (i < n) {                                              // (RGBA -> BGRA)
+    px[i] = S.map[i + 2]; px[i + 1] = S.map[i + 1]; px[i + 2] = S.map[i]; px[i + 3] = (uint8)255;
+    i = i + 4;
+  }
+  var fp: cstring = fopen(path, "wb".chars);
+  if (fp == 0) { free(px); return 0; }
+  fwrite((cstring)&hd[0], 1, 54, fp);
+  fwrite((cstring)px, 1, n, fp);
+  fclose(fp);
+  free(px);
+  vkDestroyBuffer(S.buf);
+  vkFreeMemory(S.mem);
+  return 1;
+}

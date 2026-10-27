@@ -1,6 +1,6 @@
 // the sky: marked far off -- its light is the lighting pass's (shaders/shade.frag skyL: the game's own gradient, the
 // sun's disc and glow)
-in vec2 vNdc;
+layout(location = 0) in vec2 vNdc;
 void main() {
   gAlb = vec4(0.0);
   gNrm = vec4(0.0);

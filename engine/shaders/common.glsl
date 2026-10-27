@@ -1,9 +1,6 @@
-#version 330 core
 // THE G-BUFFER: what every scene shader writes -- the surface, not its light (that's shaders/shade.frag's, once a pixel
 // after): its albedo, its normal, how rough and how metal it is, what it is and how far, the light it gives off
-uniform vec3 uCamPos;
-uniform float uObj;
-uniform float uClass;
+// (uCamPos, uObj, uClass: the prelude's)
 layout(location = 0) out vec4 gAlb;    // albedo (sRGB-encoded), a: its occlusion (creases, seams; 1 open)
 layout(location = 1) out vec4 gNrm;    // world normal, a: roughness (perceptual: 0 a mirror .. 1)
 layout(location = 2) out vec4 gObj;    // object id, class, metalness, distance (m)
